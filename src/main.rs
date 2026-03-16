@@ -192,6 +192,8 @@ async fn main() {
                     username,
                     password,
                     file_pattern,
+                    max_retries,
+                    retry_delay_secs: retry_delay,
                 };
 
                 match fls::flash_from_oci(image_ref, options).await {

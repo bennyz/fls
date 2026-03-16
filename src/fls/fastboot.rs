@@ -86,6 +86,8 @@ fn build_oci_options(options: &FastbootOptions) -> crate::fls::options::OciOptio
         username: options.username.clone(),
         password: options.password.clone(),
         file_pattern: None,
+        max_retries: crate::fls::options::DEFAULT_MAX_RETRIES,
+        retry_delay_secs: crate::fls::options::DEFAULT_RETRY_DELAY_SECS,
     }
 }
 

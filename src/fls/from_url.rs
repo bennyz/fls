@@ -49,44 +49,7 @@ async fn get_decompressor_error(
     }
 }
 
-/// Handles retry logic for download errors.
-///
-/// Returns `Some(Duration)` with the delay to wait before retrying, or `None` if
-/// the error is non-retryable or max retries have been exceeded.
-fn handle_retry_error(
-    error: &DownloadError,
-    retry_count: &mut usize,
-    max_retries: usize,
-    default_retry_delay_secs: u64,
-) -> Option<Duration> {
-    if !error.is_retryable() {
-        eprintln!(
-            "\nDownload failed with non-retryable error: {}",
-            error.format_error()
-        );
-        return None;
-    }
-
-    if *retry_count >= max_retries {
-        eprintln!("\nMax retries ({}) reached, giving up", max_retries);
-        eprintln!("Last error: {}", error.format_error());
-        return None;
-    }
-
-    let retry_delay = error
-        .suggested_retry_delay()
-        .unwrap_or_else(|| Duration::from_secs(default_retry_delay_secs));
-
-    eprintln!("\nDownload failed: {}", error.format_error());
-    eprintln!(
-        "Retrying in {} seconds... (attempt {}/{})",
-        retry_delay.as_secs(),
-        *retry_count + 1,
-        max_retries
-    );
-    *retry_count += 1;
-    Some(retry_delay)
-}
+use crate::fls::download_error::handle_download_retry;
 
 /// Execute a sequence of write commands on the block writer
 async fn execute_write_commands(
@@ -407,7 +370,7 @@ pub async fn flash_from_url(
             match start_download(url, &client, resume_from, &options.headers, debug).await {
                 Ok(r) => r,
                 Err(e) => {
-                    match handle_retry_error(
+                    match handle_download_retry(
                         &e,
                         &mut retry_count,
                         options.max_retries,
@@ -551,7 +514,7 @@ pub async fn flash_from_url(
 
             if let Some(e) = connection_error {
                 eprintln!("\nConnection interrupted: {}", e.format_error());
-                match handle_retry_error(
+                match handle_download_retry(
                     &e,
                     &mut retry_count,
                     options.max_retries,

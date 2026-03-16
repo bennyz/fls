@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+pub const DEFAULT_MAX_RETRIES: usize = 10;
+pub const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
+
 /// Common options shared between URL and OCI flash operations
 #[derive(Debug, Clone)]
 pub struct FlashOptions {
@@ -45,8 +48,8 @@ impl Default for BlockFlashOptions {
     fn default() -> Self {
         Self {
             common: FlashOptions::default(),
-            max_retries: 10,
-            retry_delay_secs: 2,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_delay_secs: DEFAULT_RETRY_DELAY_SECS,
             headers: Vec::new(),
         }
     }
@@ -59,6 +62,8 @@ pub struct OciOptions {
     pub username: Option<String>,
     pub password: Option<String>,
     pub file_pattern: Option<String>,
+    pub max_retries: usize,
+    pub retry_delay_secs: u64,
 }
 
 /// Options for fastboot flash operations

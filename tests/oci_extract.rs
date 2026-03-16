@@ -1,8 +1,8 @@
 mod common;
 
 use fls::fls::oci::extract_files_from_oci_image_to_dir;
-use fls::{FlashOptions, OciOptions};
-use http_body_util::Full;
+use fls::{FlashOptions, OciOptions, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_SECS};
+use http_body_util::{Full, StreamBody};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tar::Header;
 use tempfile::tempdir;
@@ -139,6 +140,8 @@ fn default_options(cert_dir: &Path) -> OciOptions {
         username: None,
         password: None,
         file_pattern: None,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_secs: DEFAULT_RETRY_DELAY_SECS,
     }
 }
 
@@ -377,4 +380,271 @@ async fn test_extract_tar_missing_file() {
     let written = fs::read(out_dir.path().join("boot_a.simg")).expect("read");
     assert_eq!(written, boot_data);
     assert!(!out_dir.path().join("system_a.simg").exists());
+}
+
+/// Spawn an OCI server that truncates the blob on the first request (simulating
+/// a connection drop), then serves the remaining bytes with 206 on Range retries.
+async fn spawn_oci_server_with_blob_truncation(
+    manifest_path: String,
+    blob_path: String,
+    manifest_body: Vec<u8>,
+    blob_body: Vec<u8>,
+    split_point: usize,
+) -> (SocketAddr, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    use http_body_util::BodyExt;
+
+    let cert_dir = PathBuf::from("tests/test_certs");
+    let server_cert_pem =
+        fs::read_to_string(cert_dir.join("server-cert.pem")).expect("read server cert");
+    let server_key_pem =
+        fs::read_to_string(cert_dir.join("server-key.pem")).expect("read server key");
+    let server_cert = rustls_pemfile::certs(&mut server_cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse server cert");
+    let server_key = rustls_pemfile::private_key(&mut server_key_pem.as_bytes())
+        .expect("parse server key")
+        .expect("missing server key");
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(server_cert, server_key)
+        .expect("build server config");
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+
+    let manifest_body = Arc::new(manifest_body);
+    let blob_body = Arc::new(blob_body);
+    let manifest_path = Arc::new(manifest_path);
+    let blob_path = Arc::new(blob_path);
+    let blob_request_count = Arc::new(AtomicUsize::new(0));
+    let blob_request_count_ret = blob_request_count.clone();
+
+    type BoxBody =
+        http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn full(data: Bytes) -> BoxBody {
+        Full::new(data).map_err(|never| match never {}).boxed()
+    }
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls_acceptor = tls_acceptor.clone();
+            let manifest_body = manifest_body.clone();
+            let blob_body = blob_body.clone();
+            let manifest_path = manifest_path.clone();
+            let blob_path = blob_path.clone();
+            let blob_request_count = blob_request_count.clone();
+
+            tokio::spawn(async move {
+                let tls_stream = match tls_acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let io = TokioIo::new(tls_stream);
+                let service = service_fn(move |req: HyperRequest<hyper::body::Incoming>| {
+                    let manifest_body = manifest_body.clone();
+                    let blob_body = blob_body.clone();
+                    let manifest_path = manifest_path.clone();
+                    let blob_path = blob_path.clone();
+                    let blob_request_count = blob_request_count.clone();
+                    async move {
+                        let path = req.uri().path().to_string();
+                        let response: Response<BoxBody> = if path == "/v2/" {
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(full(Bytes::new()))
+                                .unwrap()
+                        } else if path == manifest_path.as_str() {
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(
+                                    "Content-Type",
+                                    "application/vnd.oci.image.manifest.v1+json",
+                                )
+                                .body(full(Bytes::copy_from_slice(&manifest_body)))
+                                .unwrap()
+                        } else if path == blob_path.as_str() {
+                            let req_num = blob_request_count.fetch_add(1, Ordering::SeqCst);
+
+                            // Check for Range header
+                            let range_header =
+                                req.headers().get("range").and_then(|h| h.to_str().ok());
+
+                            if let Some(range) = range_header {
+                                // Parse "bytes=N-"
+                                if let Some(start_str) = range
+                                    .strip_prefix("bytes=")
+                                    .and_then(|s| s.strip_suffix('-'))
+                                {
+                                    if let Ok(start) = start_str.parse::<usize>() {
+                                        let remaining = &blob_body[start..];
+                                        let content_range = format!(
+                                            "bytes {}-{}/{}",
+                                            start,
+                                            blob_body.len() - 1,
+                                            blob_body.len()
+                                        );
+                                        let resp: Response<BoxBody> = Response::builder()
+                                            .status(StatusCode::PARTIAL_CONTENT)
+                                            .header("Content-Length", remaining.len().to_string())
+                                            .header("Content-Range", content_range)
+                                            .header("Accept-Ranges", "bytes")
+                                            .body(full(Bytes::copy_from_slice(remaining)))
+                                            .unwrap();
+                                        return Ok(resp);
+                                    }
+                                }
+                            }
+
+                            if req_num == 0 {
+                                // First request: send partial data, then break the
+                                // connection after a short delay (gives the client time
+                                // to receive headers + partial body before the error).
+                                let partial = Bytes::copy_from_slice(&blob_body[..split_point]);
+                                let body_stream = futures_util::stream::unfold(0u8, move |state| {
+                                    let partial = partial.clone();
+                                    async move {
+                                        match state {
+                                            0 => Some((
+                                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                                                    http_body::Frame::data(partial),
+                                                ),
+                                                1u8,
+                                            )),
+                                            1 => {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(100),
+                                                )
+                                                .await;
+                                                Some((Err("simulated connection break".into()), 2))
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                });
+                                let stream_body = StreamBody::new(body_stream);
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Content-Length", blob_body.len().to_string())
+                                    .header("Accept-Ranges", "bytes")
+                                    .body(stream_body.boxed())
+                                    .unwrap()
+                            } else {
+                                // Retries must use Range header for resume.
+                                // Reject non-Range retries to ensure client sends it.
+                                Response::builder()
+                                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                                    .body(full(Bytes::from("Range header required for retry")))
+                                    .unwrap()
+                            }
+                        } else {
+                            Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(full(Bytes::new()))
+                                .unwrap()
+                        };
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+
+    (local_addr, handle, blob_request_count_ret)
+}
+
+/// Reproduces the original error: a truncated gzip blob causes "Gzip decompression
+/// failed: unexpected end of file". With the new retry/resume pipeline, the download
+/// is retried with a Range header and completes successfully.
+#[tokio::test]
+async fn test_blob_truncation_triggers_retry_and_succeeds() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Create a reasonably sized blob so the split point is meaningful
+    let file_data = common::create_test_data(64 * 1024);
+    let blob_bytes = common::compress_gz(&file_data);
+    let split_point = blob_bytes.len() / 2;
+    let blob_digest = "sha256:trunctest";
+
+    let manifest_json = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:config",
+            "size": 2
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1+gzip",
+            "digest": blob_digest,
+            "size": blob_bytes.len()
+        }]
+    })
+    .to_string();
+
+    let (local_addr, server_handle, blob_request_count) = spawn_oci_server_with_blob_truncation(
+        format!("/v2/{}/manifests/{}", REPO, TAG),
+        format!("/v2/{}/blobs/{}", REPO, blob_digest),
+        manifest_json.into_bytes(),
+        blob_bytes,
+        split_point,
+    )
+    .await;
+
+    let cert_dir = PathBuf::from("tests/test_certs");
+    let host = format!("127.0.0.1.nip.io:{}", local_addr.port());
+    let image_ref = format!("{}/{}:{}", host, REPO, TAG);
+
+    let options = OciOptions {
+        common: FlashOptions {
+            insecure_tls: false,
+            cacert: Some(cert_dir.join("ca-cert.pem")),
+            ..Default::default()
+        },
+        username: None,
+        password: None,
+        file_pattern: None,
+        max_retries: 5,
+        retry_delay_secs: 0, // No delay for fast testing
+    };
+
+    let out_dir = tempdir().expect("create temp dir");
+    let target_files: HashSet<String> = ["disk.img".to_string()].into_iter().collect();
+
+    let result =
+        extract_files_from_oci_image_to_dir(&image_ref, &target_files, &options, out_dir.path())
+            .await;
+
+    server_handle.abort();
+
+    assert!(
+        result.is_ok(),
+        "Extraction should succeed after retry, but failed: {:?}",
+        result.err()
+    );
+
+    // Verify decompressed output matches original
+    let written = fs::read(out_dir.path().join("disk.img")).expect("read output");
+    assert_eq!(
+        written.len(),
+        file_data.len(),
+        "Decompressed data length mismatch"
+    );
+    assert_eq!(
+        written, file_data,
+        "Decompressed data does not match original"
+    );
+
+    // Verify that a retry actually happened (at least 2 blob requests)
+    let total_blob_requests = blob_request_count.load(Ordering::SeqCst);
+    assert!(
+        total_blob_requests >= 2,
+        "Expected at least 2 blob requests (initial + retry), got {}",
+        total_blob_requests
+    );
 }

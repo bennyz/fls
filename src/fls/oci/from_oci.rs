@@ -10,11 +10,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
+use reqwest::StatusCode;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use xz2::read::XzDecoder;
 
 use crate::fls::byte_channel::{byte_bounded_channel, ByteBoundedReceiver, ByteBoundedSender};
+use crate::fls::decompress::start_decompressor_for_compression;
+use crate::fls::download_error::{handle_download_retry, DownloadError};
 
 use super::manifest::{LayerCompression, Manifest};
 use super::reference::ImageReference;
@@ -107,147 +110,353 @@ async fn connect_and_resolve(
     Ok((client, manifest))
 }
 
-async fn stream_blob_to_file(
-    mut stream: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
-    output_path: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut prefix = Vec::new();
-    let mut initial_chunks: Vec<Bytes> = Vec::new();
-    while prefix.len() < 6 {
-        match stream.next().await {
-            Some(Ok(chunk)) => {
-                if prefix.len() < 6 {
+/// Fetch a blob stream with retry on initial connection failures.
+///
+/// Returns `(stream, initial_chunks, compression)`.
+async fn fetch_blob_with_detection(
+    client: &RegistryClient,
+    digest: &str,
+    options: &OciOptions,
+) -> Result<
+    (
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+        Vec<Bytes>,
+        Compression,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let max_retries = options.max_retries;
+    let retry_delay_secs = options.retry_delay_secs;
+    let mut retry_count: usize = 0;
+
+    loop {
+        let response = match client.get_blob_stream(digest).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Classify the error for retryability. Try DownloadError first
+                // (returned by registry for HTTP status errors), then reqwest::Error
+                // (for connection/TLS/DNS errors).
+                let (dl_err, original) = match e.downcast::<DownloadError>() {
+                    Ok(de) => (*de, None),
+                    Err(e) => {
+                        let classified = e
+                            .downcast_ref::<reqwest::Error>()
+                            .map(DownloadError::from_reqwest_ref)
+                            .unwrap_or_else(|| DownloadError::Other(e.to_string()));
+                        (classified, Some(e))
+                    }
+                };
+                match handle_download_retry(
+                    &dl_err,
+                    &mut retry_count,
+                    max_retries,
+                    retry_delay_secs,
+                ) {
+                    Some(delay) => {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    None => return Err(original.unwrap_or_else(|| dl_err.into())),
+                }
+            }
+        };
+
+        let mut stream = response.bytes_stream();
+        let mut prefix = Vec::new();
+        let mut initial_chunks: Vec<Bytes> = Vec::new();
+
+        let mut detection_failed = false;
+        while prefix.len() < 6 {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
                     let needed = 6 - prefix.len();
                     let take = needed.min(chunk.len());
                     prefix.extend_from_slice(&chunk[..take]);
+                    initial_chunks.push(chunk);
                 }
-                initial_chunks.push(chunk);
+                Some(Err(e)) => {
+                    let dl_err = DownloadError::from_reqwest(e);
+                    match handle_download_retry(
+                        &dl_err,
+                        &mut retry_count,
+                        max_retries,
+                        retry_delay_secs,
+                    ) {
+                        Some(delay) => {
+                            tokio::time::sleep(delay).await;
+                            detection_failed = true;
+                            break;
+                        }
+                        None => return Err(dl_err.into()),
+                    }
+                }
+                None => break,
             }
-            Some(Err(e)) => return Err(format!("Stream error: {}", e).into()),
-            None => break,
+        }
+        if detection_failed {
+            continue;
+        }
+        if initial_chunks.is_empty() {
+            return Err("Empty OCI layer stream".into());
+        }
+
+        let compression = detect_compression(&prefix);
+        return Ok((Box::pin(stream), initial_chunks, compression));
+    }
+}
+
+/// Run the download loop, feeding data into `buffer_tx` with retry/resume support.
+///
+/// On connection break the HTTP stream is re-established with a Range header while
+/// the buffer (and its downstream consumer) stay alive.
+async fn retry_download_loop(
+    client: &RegistryClient,
+    digest: &str,
+    mut stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    initial_chunks: Vec<Bytes>,
+    buffer_tx: &crate::fls::byte_channel::ByteBoundedSender<Bytes>,
+    options: &OciOptions,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let max_retries = options.max_retries;
+    let retry_delay_secs = options.retry_delay_secs;
+    let debug = options.common.debug;
+
+    let mut bytes_received: u64 = 0;
+    let mut retry_count: usize = 0;
+
+    // Seed buffer with the initial chunks already downloaded
+    for chunk in initial_chunks {
+        bytes_received += chunk.len() as u64;
+        if buffer_tx.send(chunk).await.is_err() {
+            // Consumer is done (e.g., tar found all target files). Not an error.
+            return Ok(bytes_received);
         }
     }
 
-    if initial_chunks.is_empty() {
-        return Err("Empty OCI layer stream".into());
-    }
+    loop {
+        let mut connection_broken = false;
+        let mut connection_error: Option<DownloadError> = None;
 
-    let blob_compression = detect_compression(&prefix);
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    let chunk_len = chunk.len() as u64;
+                    if buffer_tx.send(chunk).await.is_err() {
+                        // Consumer is done — not an error
+                        return Ok(bytes_received);
+                    }
+                    bytes_received += chunk_len;
+                    retry_count = 0;
+                }
+                Ok(Some(Err(e))) => {
+                    connection_error = Some(DownloadError::from_reqwest(e));
+                    connection_broken = true;
+                    break;
+                }
+                Ok(None) => break, // Stream completed
+                Err(_) => {
+                    connection_error = Some(DownloadError::TimeoutError(
+                        "Connection timeout (30s) during blob download".to_string(),
+                    ));
+                    connection_broken = true;
+                    break;
+                }
+            }
+        }
 
-    let (tx, rx) = mpsc::channel::<Bytes>(16);
-    for chunk in initial_chunks {
-        tx.send(chunk)
+        if !connection_broken {
+            if debug {
+                eprintln!("[DEBUG] Blob download complete: {} bytes", bytes_received);
+            }
+            return Ok(bytes_received);
+        }
+
+        if let Some(ref e) = connection_error {
+            match handle_download_retry(e, &mut retry_count, max_retries, retry_delay_secs) {
+                Some(delay) => {
+                    tokio::time::sleep(delay).await;
+                }
+                None => return Err(e.to_string().into()),
+            }
+        }
+
+        // Resume with Range header
+        match client
+            .get_blob_stream_range(digest, Some(bytes_received))
             .await
-            .map_err(|_| "Failed to send initial chunk to reader")?;
+        {
+            Ok(response) => {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    if debug {
+                        eprintln!(
+                            "[DEBUG] Registry supports Range, resuming from byte {}",
+                            bytes_received
+                        );
+                    }
+                } else {
+                    return Err(format!(
+                        "Registry does not support Range requests (got {}). \
+                         Cannot resume blob download.",
+                        response.status()
+                    )
+                    .into());
+                }
+                stream = Box::pin(response.bytes_stream());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to resume blob download from byte {}: {}",
+                    bytes_received, e
+                )
+                .into());
+            }
+        }
     }
+}
 
-    let forward_handle = tokio::spawn(async move {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-            tx.send(chunk)
-                .await
-                .map_err(|_| "Reader channel closed".to_string())?;
+/// Shared pipeline runner: handles buffer setup, download with retry/resume,
+/// pipeline drain, and decompressor exit status check.
+///
+/// The caller spawns a writer task (consuming decompressor stdout) and passes
+/// its handle here. This function manages everything else:
+///   HTTP stream → [byte-bounded buffer] → decompressor stdin
+#[allow(clippy::too_many_arguments)]
+async fn run_blob_pipeline<T: Send + 'static>(
+    client: &RegistryClient,
+    digest: &str,
+    stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    initial_chunks: Vec<Bytes>,
+    mut decompressor_stdin: tokio::process::ChildStdin,
+    mut decompressor: tokio::process::Child,
+    decompressor_name: &'static str,
+    writer_handle: tokio::task::JoinHandle<Result<T, String>>,
+    options: &OciOptions,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let buffer_size = options.common.buffer_size_mb * 1024 * 1024;
+    let (buffer_tx, mut buffer_rx) = byte_bounded_channel::<Bytes>(buffer_size, 4096);
+
+    let decompressor_writer_handle = tokio::spawn(async move {
+        while let Some(chunk) = buffer_rx.recv().await {
+            if let Err(e) = decompressor_stdin.write_all(&chunk).await {
+                return Err(format!("Error writing to decompressor stdin: {}", e));
+            }
         }
         Ok::<(), String>(())
     });
 
-    let writer_handle = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let reader = ChannelReader::new(rx);
-        let mut file = File::create(&output_path)
-            .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+    let download_result =
+        retry_download_loop(client, digest, stream, initial_chunks, &buffer_tx, options).await;
 
-        match blob_compression {
-            Compression::Gzip => {
-                let mut decoder = GzDecoder::new(reader);
-                std::io::copy(&mut decoder, &mut file)
-                    .map_err(|e| format!("Gzip decompression failed: {}", e))?;
+    drop(buffer_tx);
+
+    let (wr, dw) = tokio::join!(writer_handle, decompressor_writer_handle);
+
+    let writer_result = wr.map_err(|e| format!("Writer task panicked: {}", e))?;
+    let dw_result = dw.map_err(|e| format!("Decompressor writer panicked: {}", e))?;
+
+    // If the writer succeeded, pipeline teardown errors (broken pipe, SIGPIPE)
+    // are expected — the writer may have exited early (e.g., tar found all
+    // target files), causing the decompressor to receive SIGPIPE.
+    if let Ok(result) = writer_result {
+        let _ = decompressor.wait().await;
+        return Ok(result);
+    }
+
+    // Writer failed — check upstream errors for the root cause
+    download_result?;
+    dw_result.map_err(|e| format!("Decompressor error: {}", e))?;
+    let result = writer_result.map_err(|e| format!("Writer task error: {}", e))?;
+
+    let status = decompressor.wait().await?;
+    if !status.success() {
+        return Err(format!(
+            "{} process failed with status: {:?}",
+            decompressor_name,
+            status.code()
+        )
+        .into());
+    }
+
+    Ok(result)
+}
+
+/// Download an OCI blob to a file with retry/resume support.
+async fn stream_blob_to_file(
+    client: &RegistryClient,
+    digest: &str,
+    output_path: PathBuf,
+    options: &OciOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (stream, initial_chunks, compression) =
+        fetch_blob_with_detection(client, digest, options).await?;
+
+    let (mut decompressor, decompressor_name) = start_decompressor_for_compression(compression)?;
+    let decompressor_stdin = decompressor.stdin.take().unwrap();
+    let decompressor_stdout = decompressor.stdout.take().unwrap();
+
+    let out = output_path.clone();
+    let writer_handle = tokio::spawn(async move {
+        let mut stdout = decompressor_stdout;
+        let mut file = tokio::fs::File::create(&out)
+            .await
+            .map_err(|e| format!("Failed to create {}: {}", out.display(), e))?;
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut stdout, &mut buf)
+                .await
+                .map_err(|e| format!("Error reading decompressor stdout: {}", e))?;
+            if n == 0 {
+                break;
             }
-            Compression::Xz => {
-                let mut decoder = XzDecoder::new(reader);
-                std::io::copy(&mut decoder, &mut file)
-                    .map_err(|e| format!("XZ decompression failed: {}", e))?;
-            }
-            _ => {
-                let mut reader = reader;
-                std::io::copy(&mut reader, &mut file)
-                    .map_err(|e| format!("Stream copy failed: {}", e))?;
-            }
+            tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n])
+                .await
+                .map_err(|e| format!("Error writing to {}: {}", out.display(), e))?;
         }
-
-        file.flush()
-            .map_err(|e| format!("Failed to flush {}: {}", output_path.display(), e))?;
-        Ok(())
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .map_err(|e| format!("Failed to flush {}: {}", out.display(), e))?;
+        Ok::<(), String>(())
     });
 
-    let (forward_result, writer_result) = tokio::join!(forward_handle, writer_handle);
+    run_blob_pipeline(
+        client,
+        digest,
+        stream,
+        initial_chunks,
+        decompressor_stdin,
+        decompressor,
+        decompressor_name,
+        writer_handle,
+        options,
+    )
+    .await?;
 
-    // Prioritize writer errors — a writer failure (e.g. disk full, decompression
-    // error) drops rx, which causes the forwarder's tx.send to fail with a
-    // misleading "Reader channel closed" error.
-    writer_result
-        .map_err(|e| format!("Writer task failed: {}", e))?
-        .map_err(|e| format!("Writer task error: {}", e))?;
-    forward_result
-        .map_err(|e| format!("Stream task failed: {}", e))?
-        .map_err(|e| format!("Stream task error: {}", e))?;
-
+    eprintln!("Downloaded blob to {}", output_path.display());
     Ok(())
 }
 
+/// Download an OCI blob, decompress, and extract specific files from the tar stream.
 async fn stream_blob_to_tar_files(
-    mut stream: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
+    client: &RegistryClient,
+    digest: &str,
     target_files: std::collections::HashSet<String>,
     output_dir: PathBuf,
+    options: &OciOptions,
 ) -> Result<HashMap<String, PathBuf>, Box<dyn std::error::Error>> {
-    let mut prefix = Vec::new();
-    let mut initial_chunks: Vec<Bytes> = Vec::new();
-    while prefix.len() < 6 {
-        match stream.next().await {
-            Some(Ok(chunk)) => {
-                if prefix.len() < 6 {
-                    let needed = 6 - prefix.len();
-                    let take = needed.min(chunk.len());
-                    prefix.extend_from_slice(&chunk[..take]);
-                }
-                initial_chunks.push(chunk);
-            }
-            Some(Err(e)) => return Err(format!("Stream error: {}", e).into()),
-            None => break,
-        }
-    }
+    let (stream, initial_chunks, compression) =
+        fetch_blob_with_detection(client, digest, options).await?;
 
-    if initial_chunks.is_empty() {
-        return Err("Empty OCI layer stream".into());
-    }
+    let (mut decompressor, decompressor_name) = start_decompressor_for_compression(compression)?;
+    let decompressor_stdin = decompressor.stdin.take().unwrap();
+    let decompressor_stdout = decompressor.stdout.take().unwrap();
 
-    let blob_compression = detect_compression(&prefix);
-
-    let (tx, rx) = mpsc::channel::<Bytes>(16);
-    for chunk in initial_chunks {
-        tx.send(chunk)
-            .await
-            .map_err(|_| "Failed to send initial chunk to reader")?;
-    }
-
-    let forward_handle = tokio::spawn(async move {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-            tx.send(chunk)
-                .await
-                .map_err(|_| "Reader channel closed".to_string())?;
-        }
-        Ok::<(), String>(())
-    });
-
+    let std_stdout: std::fs::File = decompressor_stdout
+        .into_owned_fd()
+        .map_err(|e| format!("Failed to convert decompressor stdout: {}", e))?
+        .into();
     let writer_handle =
         tokio::task::spawn_blocking(move || -> Result<HashMap<String, PathBuf>, String> {
-            let reader = ChannelReader::new(rx);
-            let reader: Box<dyn Read + Send> = match blob_compression {
-                Compression::Gzip => Box::new(GzDecoder::new(reader)),
-                Compression::Xz => Box::new(XzDecoder::new(reader)),
-                _ => Box::new(reader),
-            };
-
+            let reader = std::io::BufReader::new(std_stdout);
             let mut found = HashMap::new();
             let mut archive = tar::Archive::new(reader);
             for entry_result in archive.entries().map_err(|e| format!("Tar error: {}", e))? {
@@ -297,21 +506,21 @@ async fn stream_blob_to_tar_files(
                     }
                 }
             }
-
             Ok(found)
         });
 
-    let (forward_result, writer_result) = tokio::join!(forward_handle, writer_handle);
-
-    // Prioritize writer errors (see stream_blob_to_file for rationale).
-    let found = writer_result
-        .map_err(|e| format!("Writer task failed: {}", e))?
-        .map_err(|e| format!("Writer task error: {}", e))?;
-    forward_result
-        .map_err(|e| format!("Stream task failed: {}", e))?
-        .map_err(|e| format!("Stream task error: {}", e))?;
-
-    Ok(found)
+    run_blob_pipeline(
+        client,
+        digest,
+        stream,
+        initial_chunks,
+        decompressor_stdin,
+        decompressor,
+        decompressor_name,
+        writer_handle,
+        options,
+    )
+    .await
 }
 
 /// Extract specific files from an OCI image and write them to output_dir
@@ -336,10 +545,7 @@ pub async fn extract_files_from_oci_image_to_dir(
 
     ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
 
-    // Start blob download
     println!("Starting download...");
-    let response = client.get_blob_stream(&layer.digest).await?;
-    let stream = response.bytes_stream();
 
     let is_tar_layer = layer.media_type.contains("tar") || looks_like_tar_layer(layer);
     let should_use_tar = is_tar_layer || target_files.len() > 1;
@@ -350,9 +556,14 @@ pub async fn extract_files_from_oci_image_to_dir(
         } else {
             println!("Processing as tar archive due to multiple target files...");
         }
-        let file_map =
-            stream_blob_to_tar_files(stream, target_files.clone(), output_dir.to_path_buf())
-                .await?;
+        let file_map = stream_blob_to_tar_files(
+            &client,
+            &layer.digest,
+            target_files.clone(),
+            output_dir.to_path_buf(),
+            options,
+        )
+        .await?;
         return Ok(file_map);
     }
 
@@ -367,7 +578,7 @@ pub async fn extract_files_from_oci_image_to_dir(
         .ok_or_else(|| format!("Invalid filename '{}'", filename))?;
     let output_path = output_dir.join(basename);
 
-    stream_blob_to_file(stream, output_path.clone()).await?;
+    stream_blob_to_file(&client, &layer.digest, output_path.clone(), options).await?;
 
     let mut map = HashMap::new();
     map.insert(filename.clone(), output_path);
@@ -403,12 +614,8 @@ pub async fn extract_files_by_annotations_to_dir(
                     partition
                 );
 
-                // Download this specific layer
-                let response = client.get_blob_stream(&layer.digest).await?;
-                let stream = response.bytes_stream();
-
                 let output_path = output_dir.join(format!("{}.img", sanitized_name));
-                stream_blob_to_file(stream, output_path.clone()).await?;
+                stream_blob_to_file(&client, &layer.digest, output_path.clone(), options).await?;
                 partition_files.insert(sanitized_name, output_path);
             }
         }
@@ -552,12 +759,8 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
                     partition
                 );
 
-                // Download this specific layer
-                let response = client.get_blob_stream(&layer.digest).await?;
-                let stream = response.bytes_stream();
-
                 let output_path = output_dir.join(format!("{}.img", sanitized_name));
-                stream_blob_to_file(stream, output_path.clone()).await?;
+                stream_blob_to_file(&client, &layer.digest, output_path.clone(), options).await?;
                 partition_files.insert(sanitized_name, output_path.clone());
                 if let Some(title) = annotations.get(OCI_TITLE_ANNOTATION) {
                     title_to_path.insert(title.clone(), output_path);
@@ -619,9 +822,7 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
         ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
         let output_path = output_dir.join(format!("{}.img", sanitized_partition));
 
-        let response = client.get_blob_stream(&layer.digest).await?;
-        let stream = response.bytes_stream();
-        stream_blob_to_file(stream, output_path.clone()).await?;
+        stream_blob_to_file(&client, &layer.digest, output_path.clone(), options).await?;
 
         title_to_path.insert(filename.clone(), output_path.clone());
         partition_files.insert(sanitized_partition, output_path);

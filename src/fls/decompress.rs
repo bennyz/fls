@@ -35,17 +35,43 @@ pub(crate) async fn start_decompressor_process(
 ) -> Result<(Child, &'static str), Box<dyn std::error::Error>> {
     let cmd = get_decompressor_command(url);
 
-    // Check if binary is available before attempting to spawn
     check_binary_available(cmd)?;
+    eprintln!("Using decompressor: {}", cmd);
+    spawn_decompressor(cmd)
+}
 
-    println!("Using decompressor: {}", cmd);
+/// Maps a Compression enum to the corresponding decompressor command
+pub(crate) fn decompressor_for_compression(
+    compression: crate::fls::compression::Compression,
+) -> &'static str {
+    use crate::fls::compression::Compression;
+    match compression {
+        Compression::Gzip => "zcat",
+        Compression::Xz => "xzcat",
+        Compression::Zstd => "zstdcat",
+        Compression::None => "cat",
+    }
+}
 
+/// Starts a decompressor process based on detected compression type
+pub(crate) fn start_decompressor_for_compression(
+    compression: crate::fls::compression::Compression,
+) -> Result<(Child, &'static str), Box<dyn std::error::Error>> {
+    let cmd = decompressor_for_compression(compression);
+    check_binary_available(cmd)?;
+    eprintln!("Using decompressor: {}", cmd);
+    spawn_decompressor(cmd)
+}
+
+/// Spawns a decompressor subprocess with piped stdin/stdout/stderr
+fn spawn_decompressor(
+    cmd: &'static str,
+) -> Result<(Child, &'static str), Box<dyn std::error::Error>> {
     let process = Command::new(cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-
     Ok((process, cmd))
 }
 
