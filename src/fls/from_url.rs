@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::block_writer::{AsyncBlockWriter, WriteStats};
 use crate::fls::byte_channel::byte_bounded_channel;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::download_error::DownloadError;
@@ -18,7 +18,7 @@ use crate::fls::simg::{SparseParser, WriteCommand};
 /// Await a writer handle and return its result
 ///
 /// Converts task panics into io::Error for uniform error handling.
-async fn await_writer_result(handle: JoinHandle<io::Result<u64>>) -> io::Result<u64> {
+async fn await_writer_result(handle: JoinHandle<io::Result<WriteStats>>) -> io::Result<WriteStats> {
     match handle.await {
         Ok(result) => result,
         Err(e) => Err(io::Error::other(format!("Writer task panicked: {}", e))),
@@ -29,7 +29,9 @@ async fn await_writer_result(handle: JoinHandle<io::Result<u64>>) -> io::Result<
 ///
 /// Called when writer_handle.is_finished() returns true unexpectedly during download.
 /// Returns an appropriate error for the unexpected termination.
-async fn get_writer_error(handle: JoinHandle<io::Result<u64>>) -> Box<dyn std::error::Error> {
+async fn get_writer_error(
+    handle: JoinHandle<io::Result<WriteStats>>,
+) -> Box<dyn std::error::Error> {
     match await_writer_result(handle).await {
         Ok(_) => "Writer closed unexpectedly before download completed".into(),
         Err(e) => e.into(),
@@ -239,6 +241,7 @@ pub async fn flash_from_url(
         written_progress_tx,
         options.common.debug,
         options.common.o_direct,
+        options.common.skip_unchanged,
         options.common.write_buffer_size_mb,
     )?;
 
@@ -739,8 +742,11 @@ pub async fn flash_from_url(
     }
 
     // Get final result from writer
-    match writer_handle.await {
-        Ok(Ok(final_bytes)) => progress.bytes_written = final_bytes,
+    let write_stats = match writer_handle.await {
+        Ok(Ok(stats)) => {
+            progress.bytes_written = stats.bytes_written;
+            Some(stats)
+        }
         Ok(Err(e)) => {
             eprintln!();
             return Err(e.into());
@@ -749,7 +755,7 @@ pub async fn flash_from_url(
             eprintln!();
             return Err(e.into());
         }
-    }
+    };
 
     // Capture the write rate and duration at completion
     let elapsed = progress.start_time.elapsed();
@@ -776,6 +782,9 @@ pub async fn flash_from_url(
     let _ = tokio::time::timeout(timeout_duration, error_processor).await;
 
     progress.print_final_stats_with_ratio();
+    if let Some(stats) = write_stats {
+        stats.print_skip_summary();
+    }
 
     Ok(())
 }

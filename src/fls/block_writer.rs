@@ -91,6 +91,22 @@ fn open_for_regular_file(path: &str) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Opens a regular file for read+write without truncation (for skip-unchanged mode)
+fn open_for_regular_file_no_truncate(path: &str) -> io::Result<std::fs::File> {
+    if path.starts_with("/dev/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Regular file path cannot be under /dev/; ensure the device path is correctly spelled",
+        ));
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
 /// Opens a file for a device with custom flags
 fn open_for_device_with_flags(path: &str, flags: libc::c_int) -> io::Result<std::fs::File> {
     OpenOptions::new()
@@ -116,6 +132,38 @@ fn open_for_regular_file_with_flags(path: &str, flags: libc::c_int) -> io::Resul
         .open(path)
 }
 
+/// Statistics about write operations (used for skip-unchanged reporting)
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WriteStats {
+    pub bytes_written: u64,
+    pub blocks_total: u64,
+    pub blocks_skipped: u64,
+    pub bytes_skipped: u64,
+}
+
+impl WriteStats {
+    pub fn skip_percentage(&self) -> f64 {
+        if self.blocks_total == 0 {
+            0.0
+        } else {
+            (self.blocks_skipped as f64 / self.blocks_total as f64) * 100.0
+        }
+    }
+
+    /// Print skip summary if skip-unchanged was active
+    pub fn print_skip_summary(&self) {
+        if self.blocks_total > 0 {
+            println!(
+                "Blocks skipped: {}/{} ({:.1}% unchanged, {:.2} MB saved)",
+                self.blocks_skipped,
+                self.blocks_total,
+                self.skip_percentage(),
+                self.bytes_skipped as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+}
+
 /// BlockWriter handles writing data to a block device with direct I/O
 pub(crate) struct BlockWriter {
     file: std::fs::File,
@@ -124,7 +172,11 @@ pub(crate) struct BlockWriter {
     bytes_written: u64,
     bytes_since_sync: u64, // Track bytes written since last sync
     written_progress_tx: mpsc::UnboundedSender<u64>,
-    use_direct_io: bool, // Track if O_DIRECT is active
+    use_direct_io: bool,                // Track if O_DIRECT is active
+    skip_unchanged: bool,               // Read-before-write optimization
+    read_buffer: Option<AlignedBuffer>, // Buffer for read-before-write comparison
+    file_offset: u64,                   // Absolute file position for read_at
+    stats: WriteStats,                  // Skip statistics
     #[allow(dead_code)]
     debug: bool, // Debug mode flag
 }
@@ -140,6 +192,7 @@ impl BlockWriter {
         written_progress_tx: mpsc::UnboundedSender<u64>,
         debug: bool,
         o_direct: bool,
+        skip_unchanged: bool,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let (file, use_direct_io) = {
@@ -159,6 +212,7 @@ impl BlockWriter {
                     Some(f) if is_block_dev => open_for_device_with_flags(device, f),
                     Some(f) => open_for_regular_file_with_flags(device, f),
                     None if is_block_dev => open_for_device(device),
+                    None if skip_unchanged => open_for_regular_file_no_truncate(device),
                     None => open_for_regular_file(device),
                 }
             };
@@ -257,6 +311,7 @@ impl BlockWriter {
                     Some(f) if is_device => open_for_device_with_flags(device, f),
                     Some(f) => open_for_regular_file_with_flags(device, f),
                     None if is_device => open_for_device(device),
+                    None if skip_unchanged => open_for_regular_file_no_truncate(device),
                     None => open_for_regular_file(device),
                 }
             };
@@ -295,6 +350,13 @@ impl BlockWriter {
         // Direct I/O requires buffer to be aligned to sector size (typically 512 or 4096)
         let buffer = AlignedBuffer::new(BLOCK_SIZE, ALIGNMENT);
 
+        // Allocate read buffer only when skip-unchanged is enabled
+        let read_buffer = if skip_unchanged {
+            Some(AlignedBuffer::new(BLOCK_SIZE, ALIGNMENT))
+        } else {
+            None
+        };
+
         Ok(Self {
             file,
             buffer,
@@ -303,6 +365,10 @@ impl BlockWriter {
             bytes_since_sync: 0,
             written_progress_tx,
             use_direct_io,
+            skip_unchanged,
+            read_buffer,
+            file_offset: 0,
+            stats: WriteStats::default(),
             debug,
         })
     }
@@ -366,6 +432,7 @@ impl BlockWriter {
 
         // Update our position tracking
         self.bytes_written = offset;
+        self.file_offset = offset;
 
         // Send progress update
         let _ = self.written_progress_tx.send(self.bytes_written);
@@ -395,6 +462,34 @@ impl BlockWriter {
 
         let write_size = write_size.min(BLOCK_SIZE);
 
+        // Skip-unchanged: read current device content and compare before writing
+        if self.skip_unchanged {
+            self.stats.blocks_total += 1;
+
+            if let Some(ref mut read_buf) = self.read_buffer {
+                use std::os::unix::fs::FileExt;
+                let read_slice = &mut read_buf.as_mut_slice()[..write_size];
+                match self.file.read_at(read_slice, self.file_offset) {
+                    Ok(n) if n == write_size => {
+                        if read_slice == &self.buffer.as_slice()[..write_size] {
+                            // Data matches — skip the write
+                            self.stats.blocks_skipped += 1;
+                            self.stats.bytes_skipped += actual_bytes as u64;
+                            self.file_offset += write_size as u64;
+                            // Advance kernel file position past the skipped block
+                            self.file.seek(io::SeekFrom::Current(write_size as i64))?;
+                            self.buffer_pos = 0;
+                            return Ok(());
+                        }
+                    }
+                    _ => {
+                        // Read failed or short read (e.g., first flash, regular file)
+                        // — proceed with write
+                    }
+                }
+            }
+        }
+
         let buffer_slice = self.buffer.as_slice();
         self.file
             .write_all(&buffer_slice[..write_size])
@@ -409,6 +504,8 @@ impl BlockWriter {
                 }
                 e
             })?;
+
+        self.file_offset += write_size as u64;
 
         // Track actual bytes for sync interval, not padded write size
         self.bytes_since_sync += actual_bytes as u64;
@@ -457,9 +554,11 @@ impl BlockWriter {
         Ok(())
     }
 
-    /// Get total bytes written
-    pub(crate) fn bytes_written(&self) -> u64 {
-        self.bytes_written
+    /// Get write statistics (includes skip-unchanged info)
+    pub(crate) fn write_stats(&self) -> WriteStats {
+        let mut stats = self.stats.clone();
+        stats.bytes_written = self.bytes_written;
+        stats
     }
 }
 
@@ -477,7 +576,7 @@ pub(crate) enum WriterCommand {
 /// Async wrapper for BlockWriter that runs in a blocking task
 pub(crate) struct AsyncBlockWriter {
     writer_tx: mpsc::Sender<WriterCommand>,
-    writer_handle: tokio::task::JoinHandle<io::Result<u64>>,
+    writer_handle: tokio::task::JoinHandle<io::Result<WriteStats>>,
 }
 
 impl AsyncBlockWriter {
@@ -487,6 +586,7 @@ impl AsyncBlockWriter {
         written_progress_tx: mpsc::UnboundedSender<u64>,
         debug: bool,
         o_direct: bool,
+        skip_unchanged: bool,
         write_buffer_size_mb: usize,
     ) -> io::Result<Self> {
         // Calculate channel capacity based on buffer size
@@ -507,11 +607,17 @@ impl AsyncBlockWriter {
 
         // Spawn blocking task for I/O operations
         let writer_handle = tokio::task::spawn_blocking(move || {
-            let mut writer = BlockWriter::new(&device, written_progress_tx, debug, o_direct)
-                .map_err(|e| {
-                    eprintln!("Failed to open device '{}': {}", device, e);
-                    e
-                })?;
+            let mut writer = BlockWriter::new(
+                &device,
+                written_progress_tx,
+                debug,
+                o_direct,
+                skip_unchanged,
+            )
+            .map_err(|e| {
+                eprintln!("Failed to open device '{}': {}", device, e);
+                e
+            })?;
 
             while let Some(cmd) = writer_rx.blocking_recv() {
                 let result = match cmd {
@@ -550,7 +656,7 @@ impl AsyncBlockWriter {
             }
 
             writer.flush()?;
-            Ok(writer.bytes_written())
+            Ok(writer.write_stats())
         });
 
         Ok(Self {
@@ -587,7 +693,7 @@ impl AsyncBlockWriter {
     }
 
     /// Close the writer and wait for completion
-    pub(crate) async fn close(self) -> io::Result<u64> {
+    pub(crate) async fn close(self) -> io::Result<WriteStats> {
         drop(self.writer_tx);
         self.writer_handle.await.map_err(io::Error::other)?
     }
@@ -611,6 +717,99 @@ fn write_fill_pattern(writer: &mut BlockWriter, pattern: &[u8; 4], bytes: u64) -
         remaining -= to_write as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_write_stats_skip_percentage() {
+        let stats = WriteStats {
+            bytes_written: 1024,
+            blocks_total: 100,
+            blocks_skipped: 75,
+            bytes_skipped: 768,
+        };
+        assert!((stats.skip_percentage() - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_write_stats_zero_blocks() {
+        let stats = WriteStats::default();
+        assert!((stats.skip_percentage() - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_skip_unchanged_skips_identical_data() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // First write: populate the file with known data
+        {
+            let mut writer = BlockWriter::new(&path, tx.clone(), false, false, false).unwrap();
+            let data = vec![0xABu8; 8192];
+            writer.write(&data).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Second write with skip_unchanged: same data should be skipped
+        {
+            let mut writer = BlockWriter::new(&path, tx.clone(), false, false, true).unwrap();
+            let data = vec![0xABu8; 8192];
+            writer.write(&data).unwrap();
+            writer.flush().unwrap();
+            let stats = writer.write_stats();
+            assert_eq!(stats.blocks_total, 1);
+            assert_eq!(stats.blocks_skipped, 1);
+            assert_eq!(stats.bytes_skipped, 8192);
+        }
+    }
+
+    #[test]
+    fn test_skip_unchanged_writes_different_data() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // First write
+        {
+            let mut writer = BlockWriter::new(&path, tx.clone(), false, false, false).unwrap();
+            let data = vec![0xAAu8; 8192];
+            writer.write(&data).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Second write with different data — should NOT skip
+        {
+            let mut writer = BlockWriter::new(&path, tx.clone(), false, false, true).unwrap();
+            let data = vec![0xBBu8; 8192];
+            writer.write(&data).unwrap();
+            writer.flush().unwrap();
+            let stats = writer.write_stats();
+            assert_eq!(stats.blocks_total, 1);
+            assert_eq!(stats.blocks_skipped, 0);
+        }
+    }
+
+    #[test]
+    fn test_skip_unchanged_disabled_no_stats() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut writer = BlockWriter::new(&path, tx, false, false, false).unwrap();
+        let data = vec![0xCCu8; 4096];
+        writer.write(&data).unwrap();
+        writer.flush().unwrap();
+        let stats = writer.write_stats();
+        // When disabled, blocks_total stays 0
+        assert_eq!(stats.blocks_total, 0);
+        assert_eq!(stats.blocks_skipped, 0);
+    }
 }
 
 /// Check if a path is a block device

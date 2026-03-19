@@ -20,7 +20,7 @@ use super::manifest::{LayerCompression, Manifest};
 use super::reference::ImageReference;
 use super::registry::RegistryClient;
 use crate::fls::automotive::annotations as automotive_annotations;
-use crate::fls::block_writer::AsyncBlockWriter;
+use crate::fls::block_writer::{AsyncBlockWriter, WriteStats};
 use crate::fls::compression::Compression;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::error_handling::process_error_messages;
@@ -53,7 +53,7 @@ struct DownloadContext {
 /// Parameters for raw disk download coordination
 struct RawDiskDownloadParams {
     http_tx: ByteBoundedSender<bytes::Bytes>,
-    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    writer_handle: tokio::task::JoinHandle<Result<WriteStats, std::io::Error>>,
     external_decompressor: Option<tokio::process::Child>,
     decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
     raw_written_progress_rx: mpsc::UnboundedReceiver<u64>,
@@ -61,7 +61,7 @@ struct RawDiskDownloadParams {
 
 /// Processing handles for coordination functions
 struct ProcessingHandles {
-    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    writer_handle: tokio::task::JoinHandle<Result<WriteStats, std::io::Error>>,
     decompressor_writer_handle: tokio::task::JoinHandle<Result<(), String>>,
     error_processor: tokio::task::JoinHandle<()>,
     tar_extractor_handle: tokio::task::JoinHandle<Result<(), String>>,
@@ -69,7 +69,7 @@ struct ProcessingHandles {
 
 /// Components returned by external decompressor pipeline setup
 struct ExternalDecompressorPipeline {
-    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    writer_handle: tokio::task::JoinHandle<Result<WriteStats, std::io::Error>>,
     decompressor: tokio::process::Child,
 }
 
@@ -81,7 +81,7 @@ struct TarPipelineComponents {
     decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
     written_progress_rx: mpsc::UnboundedReceiver<u64>,
     decompressor_written_progress_rx: mpsc::UnboundedReceiver<u64>,
-    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
+    writer_handle: tokio::task::JoinHandle<Result<WriteStats, std::io::Error>>,
     decompressor_writer_handle: tokio::task::JoinHandle<Result<(), String>>,
     error_processor: tokio::task::JoinHandle<()>,
     decompressor: tokio::process::Child,
@@ -933,6 +933,7 @@ async fn setup_tar_processing_pipeline(
         written_progress_tx.clone(),
         options.common.debug,
         options.common.o_direct,
+        options.common.skip_unchanged,
         options.common.write_buffer_size_mb,
     )?;
 
@@ -1193,13 +1194,14 @@ async fn coordinate_download_and_processing(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    match handles.writer_handle.await {
-        Ok(Ok(final_bytes)) => {
-            progress.bytes_written = final_bytes;
+    let write_stats = match handles.writer_handle.await {
+        Ok(Ok(stats)) => {
+            progress.bytes_written = stats.bytes_written;
+            Some(stats)
         }
         Ok(Err(e)) => return Err(Box::new(e)),
         Err(e) => return Err(e.into()),
-    }
+    };
 
     progress.write_duration = Some(progress.start_time.elapsed());
 
@@ -1211,6 +1213,9 @@ async fn coordinate_download_and_processing(
 
     // Print final stats
     progress.print_final_stats();
+    if let Some(stats) = write_stats {
+        stats.print_skip_summary();
+    }
 
     Ok(())
 }
@@ -1347,7 +1352,8 @@ async fn setup_inprocess_decompression_pipeline(
     decompressed_progress_tx: mpsc::UnboundedSender<u64>,
     compression_type: Compression,
     debug: bool,
-) -> Result<tokio::task::JoinHandle<Result<u64, std::io::Error>>, Box<dyn std::error::Error>> {
+) -> Result<tokio::task::JoinHandle<Result<WriteStats, std::io::Error>>, Box<dyn std::error::Error>>
+{
     // Gzip or None: decompress in-process and write directly to block writer
     let writer = block_writer;
     let progress_tx = decompressed_progress_tx;
@@ -1551,14 +1557,15 @@ async fn coordinate_raw_disk_download(
     }
 
     // Get final result
-    match params.writer_handle.await {
-        Ok(Ok(final_bytes)) => {
-            progress.bytes_written = final_bytes;
-            progress.bytes_decompressed = final_bytes;
+    let write_stats = match params.writer_handle.await {
+        Ok(Ok(stats)) => {
+            progress.bytes_written = stats.bytes_written;
+            progress.bytes_decompressed = stats.bytes_written;
+            Some(stats)
         }
         Ok(Err(e)) => return Err(Box::new(e)),
         Err(e) => return Err(e.into()),
-    }
+    };
 
     let elapsed = progress.start_time.elapsed();
     progress.decompress_duration = Some(elapsed);
@@ -1587,6 +1594,9 @@ async fn coordinate_raw_disk_download(
 
     // Print final stats
     progress.print_final_stats();
+    if let Some(stats) = write_stats {
+        stats.print_skip_summary();
+    }
 
     Ok(())
 }
@@ -2284,6 +2294,7 @@ async fn flash_raw_disk_image_directly(
         raw_written_progress_tx,
         options.common.debug,
         options.common.o_direct,
+        options.common.skip_unchanged,
         options.common.write_buffer_size_mb,
     )?;
 

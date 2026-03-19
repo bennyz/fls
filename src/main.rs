@@ -60,6 +60,9 @@ enum Commands {
         /// Enable O_DIRECT mode for direct I/O (bypasses OS cache)
         #[arg(long)]
         o_direct: bool,
+        /// Skip writing blocks that are already identical on the device (read-before-write)
+        #[arg(long)]
+        skip_unchanged: bool,
         /// Custom HTTP headers (can be used multiple times, format: 'Header: value')
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
@@ -129,6 +132,7 @@ async fn main() {
             retry_delay,
             debug,
             o_direct,
+            skip_unchanged,
             headers,
             progress_interval,
             newline_progress,
@@ -185,6 +189,7 @@ async fn main() {
                         write_buffer_size_mb: write_buffer_size,
                         debug,
                         o_direct,
+                        skip_unchanged,
                         progress_interval_secs: progress_interval,
                         newline_progress,
                         show_memory,
@@ -260,6 +265,7 @@ async fn main() {
                         write_buffer_size_mb: write_buffer_size,
                         debug,
                         o_direct,
+                        skip_unchanged,
                         progress_interval_secs: progress_interval,
                         newline_progress,
                         show_memory,
