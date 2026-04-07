@@ -76,8 +76,13 @@ impl DownloadError {
         Self::from_http_status(status)
     }
 
-    /// Create a DownloadError from a reqwest::Error
+    /// Create a DownloadError from a reqwest::Error (owned)
     pub fn from_reqwest(error: reqwest::Error) -> Self {
+        Self::from_reqwest_ref(&error)
+    }
+
+    /// Create a DownloadError from a reqwest::Error reference
+    pub fn from_reqwest_ref(error: &reqwest::Error) -> Self {
         if error.is_status() {
             if let Some(status) = error.status() {
                 return Self::from_http_status(status);
@@ -93,22 +98,17 @@ impl DownloadError {
             let error_str = error.to_string();
 
             // Check error source chain for TLS/SSL/Certificate errors
-            // We use a hybrid approach: check both type names and error messages
-            // - Type names catch concrete types before trait object erasure
-            // - Error messages catch issues when types are erased to dyn Error
-            let mut current_error: Option<&dyn std::error::Error> = Some(&error);
+            let mut current_error: Option<&dyn std::error::Error> = Some(error);
             let mut is_tls_error = false;
 
             while let Some(err) = current_error {
                 let error_msg = err.to_string().to_lowercase();
 
-                // Check error message for TLS-related keywords
-                // This works even when types are erased to trait objects
                 let message_indicates_tls = error_msg.contains("certificate")
                     || error_msg.contains("tls")
                     || error_msg.contains("ssl")
-                    || error_msg.contains("trust setting")  // macOS Security Framework
-                    || error_msg.contains("trust policy"); // macOS Security Framework
+                    || error_msg.contains("trust setting")
+                    || error_msg.contains("trust policy");
 
                 if message_indicates_tls {
                     is_tls_error = true;
@@ -122,14 +122,12 @@ impl DownloadError {
                 return DownloadError::TlsError(error_str);
             }
 
-            // Check for DNS errors
             if error_str.contains("dns") || error_str.contains("failed to lookup address") {
                 return DownloadError::DnsError(error_str);
             }
             return DownloadError::ConnectionError(error_str);
         }
 
-        // Fallback for other error types
         DownloadError::Other(error.to_string())
     }
 
@@ -230,6 +228,42 @@ impl fmt::Display for DownloadError {
 }
 
 impl std::error::Error for DownloadError {}
+
+/// Shared retry handler for download errors.
+///
+/// Returns `Some(Duration)` with the delay to wait before retrying, or `None` if
+/// the error is non-retryable or max retries have been exceeded.
+pub fn handle_download_retry(
+    error: &DownloadError,
+    retry_count: &mut usize,
+    max_retries: usize,
+    default_retry_delay_secs: u64,
+) -> Option<Duration> {
+    if !error.is_retryable() {
+        eprintln!(
+            "\nDownload failed with non-retryable error: {}",
+            error.format_error()
+        );
+        return None;
+    }
+    if *retry_count >= max_retries {
+        eprintln!("\nMax retries ({}) reached, giving up", max_retries);
+        eprintln!("Last error: {}", error.format_error());
+        return None;
+    }
+    let retry_delay = error
+        .suggested_retry_delay()
+        .unwrap_or_else(|| Duration::from_secs(default_retry_delay_secs));
+    eprintln!("\nDownload failed: {}", error.format_error());
+    eprintln!(
+        "Retrying in {} seconds... (attempt {}/{})",
+        retry_delay.as_secs(),
+        *retry_count + 1,
+        max_retries
+    );
+    *retry_count += 1;
+    Some(retry_delay)
+}
 
 #[cfg(test)]
 mod tests {

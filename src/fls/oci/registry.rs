@@ -9,6 +9,7 @@ use reqwest::{Client, Response, StatusCode};
 use super::auth::{request_token, Credentials, WwwAuthenticate};
 use super::manifest::{media_types, Manifest};
 use super::reference::ImageReference;
+use crate::fls::download_error::DownloadError;
 use crate::fls::options::{HttpClientOptions, OciOptions};
 
 /// OCI Registry client
@@ -205,6 +206,19 @@ impl RegistryClient {
         &self,
         digest: &str,
     ) -> Result<Response, Box<dyn std::error::Error>> {
+        self.get_blob_stream_range(digest, None).await
+    }
+
+    /// Fetch a blob as a streaming response, optionally resuming from a byte offset.
+    ///
+    /// When `resume_from` is `Some(offset)`, sends a `Range: bytes=<offset>-` header.
+    /// The caller should check for `StatusCode::PARTIAL_CONTENT` (206) to confirm
+    /// the registry supports range requests.
+    pub async fn get_blob_stream_range(
+        &self,
+        digest: &str,
+        resume_from: Option<u64>,
+    ) -> Result<Response, Box<dyn std::error::Error>> {
         let url = format!(
             "{}/v2/{}/blobs/{}",
             self.image_ref.registry_url(),
@@ -213,16 +227,24 @@ impl RegistryClient {
         );
 
         if self.debug {
-            eprintln!("[DEBUG] Starting blob download: {}", url);
+            if let Some(offset) = resume_from {
+                eprintln!(
+                    "[DEBUG] Resuming blob download from byte {}: {}",
+                    offset, url
+                );
+            } else {
+                eprintln!("[DEBUG] Starting blob download: {}", url);
+            }
         }
 
-        let request = self.client.get(&url);
+        let mut request = self.client.get(&url);
+        if let Some(offset) = resume_from {
+            request = request.header("Range", format!("bytes={}-", offset));
+        }
         let response = self.add_auth(request).send().await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("Failed to fetch blob: {} - {}", status, body).into());
+        if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(DownloadError::from_http_status(response.status()).into());
         }
 
         if self.debug {

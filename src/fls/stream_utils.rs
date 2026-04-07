@@ -1,52 +1,26 @@
+use crate::fls::byte_channel::ByteBoundedReceiver;
 /// Stream utilities for async/sync bridging and download handling
 ///
 /// Provides reusable components for streaming data between async HTTP
 /// downloads and sync processing (like tar extraction or decompression).
 use bytes::Bytes;
 use std::io::Read;
-use tokio::sync::mpsc;
 
-use crate::fls::byte_channel::ByteBoundedReceiver;
-
-/// Abstraction over plain and byte-bounded receivers
-enum ReceiverVariant {
-    Plain(mpsc::Receiver<Bytes>),
-    ByteBounded(ByteBoundedReceiver<Bytes>),
-}
-
-impl ReceiverVariant {
-    fn blocking_recv(&mut self) -> Option<Bytes> {
-        match self {
-            ReceiverVariant::Plain(rx) => rx.blocking_recv(),
-            ReceiverVariant::ByteBounded(rx) => rx.blocking_recv(),
-        }
-    }
-}
-
-/// Reader that pulls bytes from a tokio mpsc channel
+/// Reader that pulls bytes from a byte-bounded channel
 ///
 /// This bridges async HTTP streaming with synchronous readers
 /// like tar::Archive or flate2::GzDecoder.
 pub struct ChannelReader {
-    rx: ReceiverVariant,
+    rx: ByteBoundedReceiver<Bytes>,
     current: Option<Bytes>,
     offset: usize,
 }
 
 impl ChannelReader {
-    /// Create a new ChannelReader from a plain mpsc receiver
-    pub fn new(rx: mpsc::Receiver<Bytes>) -> Self {
-        Self {
-            rx: ReceiverVariant::Plain(rx),
-            current: None,
-            offset: 0,
-        }
-    }
-
     /// Create a new ChannelReader from a byte-bounded receiver
     pub fn new_byte_bounded(rx: ByteBoundedReceiver<Bytes>) -> Self {
         Self {
-            rx: ReceiverVariant::ByteBounded(rx),
+            rx,
             current: None,
             offset: 0,
         }

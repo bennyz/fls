@@ -24,6 +24,7 @@ pub use from_url::flash_from_url;
 pub use oci::flash_from_oci;
 pub use options::{
     BlockFlashOptions, FastbootOptions, FlashOptions, HttpClientOptions, OciOptions,
+    DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_SECS,
 };
 
 #[cfg(test)]

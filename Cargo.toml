@@ -23,6 +23,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 xz2 = "0.1"
 
 [dev-dependencies]
+http-body = "1.0.1"
 wiremock = "0.6"
 tempfile = "3"
 tokio = { version = "1.0", features = ["full", "rt-multi-thread"] }
