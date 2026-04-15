@@ -64,6 +64,10 @@ pub struct ImageManifest {
     #[serde(default)]
     pub media_type: Option<String>,
 
+    /// Artifact type (OCI v1.1) - indicates the primary content type
+    #[serde(default)]
+    pub artifact_type: Option<String>,
+
     /// Config blob descriptor
     pub config: Descriptor,
 
@@ -130,19 +134,42 @@ impl Manifest {
     }
 
     /// Get the single layer from an image manifest
-    /// Returns error if there are no layers or multiple layers
+    ///
+    /// Returns:
+    /// - the only layer for single-layer manifests
+    /// - for multi-layer manifests: artifactType match first, otherwise first automotive disk layer
+    /// - error when no suitable layer is found
     pub fn get_single_layer(&self) -> Result<&Descriptor, String> {
         match self {
             Manifest::Image(ref m) => {
                 if m.layers.is_empty() {
-                    Err("Manifest has no layers".to_string())
-                } else if m.layers.len() > 1 {
-                    // For multi-layer images, we take the last layer
-                    // which typically contains the actual content
-                    Ok(m.layers.last().unwrap())
-                } else {
-                    Ok(&m.layers[0])
+                    return Err("Manifest has no layers".to_string());
                 }
+
+                if m.layers.len() == 1 {
+                    return Ok(&m.layers[0]);
+                }
+
+                // If artifactType is set, find the layer matching it
+                if let Some(ref artifact_type) = m.artifact_type {
+                    if let Some(layer) = m.layers.iter().find(|l| l.media_type == *artifact_type) {
+                        return Ok(layer);
+                    }
+                }
+
+                // Fall back to the first disk image layer
+                if let Some(layer) = m
+                    .layers
+                    .iter()
+                    .find(|l| l.media_type.starts_with("application/vnd.automotive.disk"))
+                {
+                    return Ok(layer);
+                }
+
+                Err(format!(
+                    "No disk image layer found among {} layers",
+                    m.layers.len()
+                ))
             }
             Manifest::Index(_) => Err(
                 "Cannot get layer from manifest index - need to resolve platform first".to_string(),
@@ -254,6 +281,143 @@ mod tests {
             }
             _ => panic!("Expected image manifest"),
         }
+    }
+
+    #[test]
+    fn test_single_flashable_layer() {
+        let json = r#"{
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:config123",
+                "size": 100
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.automotive.disk.raw",
+                    "digest": "sha256:disk123",
+                    "size": 9999
+                }
+            ]
+        }"#;
+        let manifest = Manifest::parse(json.as_bytes(), None).unwrap();
+        let layer = manifest.get_single_layer().unwrap();
+        assert_eq!(layer.digest, "sha256:disk123");
+    }
+
+    #[test]
+    fn test_single_non_disk_layer_returned() {
+        // Single-layer manifests return the layer regardless of media type;
+        // callers (e.g. flash_from_oci) are responsible for validating
+        // flashable media types when appropriate.
+        let json = r#"{
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:config123",
+                "size": 100
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:layer123",
+                    "size": 5678
+                }
+            ]
+        }"#;
+        let manifest = Manifest::parse(json.as_bytes(), None).unwrap();
+        let layer = manifest.get_single_layer().unwrap();
+        assert_eq!(layer.digest, "sha256:layer123");
+    }
+
+    #[test]
+    fn test_artifact_type_selection() {
+        // Two flashable layers: artifactType must pick the qcow2 layer,
+        // NOT the raw layer which appears first (and would be chosen by the fallback).
+        let json = r#"{
+            "schemaVersion": 2,
+            "artifactType": "application/vnd.automotive.disk.qcow2",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:config123",
+                "size": 100
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.automotive.disk.raw",
+                    "digest": "sha256:disk_raw",
+                    "size": 1000
+                },
+                {
+                    "mediaType": "application/vnd.automotive.disk.qcow2",
+                    "digest": "sha256:disk_qcow2",
+                    "size": 9999
+                }
+            ]
+        }"#;
+        let manifest = Manifest::parse(json.as_bytes(), None).unwrap();
+        let layer = manifest.get_single_layer().unwrap();
+        assert_eq!(layer.digest, "sha256:disk_qcow2");
+    }
+
+    #[test]
+    fn test_artifact_type_no_match_falls_back_to_disk_layer() {
+        // artifactType doesn't match any layer — should fall back to the first disk layer
+        let json = r#"{
+            "schemaVersion": 2,
+            "artifactType": "application/vnd.unknown.type",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:config123",
+                "size": 100
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:tar_layer",
+                    "size": 1000
+                },
+                {
+                    "mediaType": "application/vnd.automotive.disk.raw",
+                    "digest": "sha256:disk1",
+                    "size": 9999
+                }
+            ]
+        }"#;
+        let manifest = Manifest::parse(json.as_bytes(), None).unwrap();
+        let layer = manifest.get_single_layer().unwrap();
+        assert_eq!(layer.digest, "sha256:disk1");
+    }
+
+    #[test]
+    fn test_no_flashable_layer_error() {
+        let json = r#"{
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:config123",
+                "size": 100
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:layer1",
+                    "size": 1000
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
+                    "digest": "sha256:layer2",
+                    "size": 2000
+                }
+            ]
+        }"#;
+        let manifest = Manifest::parse(json.as_bytes(), None).unwrap();
+        let err = manifest.get_single_layer().unwrap_err();
+        assert!(
+            err.contains("No disk image layer found"),
+            "Expected no-match error, got: {}",
+            err
+        );
     }
 
     #[test]
