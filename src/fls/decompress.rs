@@ -1,6 +1,29 @@
+use crate::fls::byte_channel::ByteBoundedReceiver;
+use crate::fls::compression::Compression;
+use crate::fls::stream_utils::ChannelReader;
+use bytes::Bytes;
+use std::io::Read;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+
+fn mb_to_bytes(mb: u64) -> u64 {
+    mb.saturating_mul(1024 * 1024)
+}
+
+pub(crate) fn create_xz_decoder<R: Read>(
+    reader: R,
+    memlimit_mb: u64,
+) -> Result<liblzma::read::XzDecoder<R>, String> {
+    let memlimit = mb_to_bytes(memlimit_mb);
+    let stream = liblzma::stream::Stream::new_stream_decoder(memlimit, 0).map_err(|e| {
+        format!(
+            "Failed to create XZ decoder with {}MB limit: {}",
+            memlimit_mb, e
+        )
+    })?;
+    Ok(liblzma::read::XzDecoder::new_stream(reader, stream))
+}
 
 /// Determines the appropriate decompression command based on URL extension
 fn get_decompressor_command(url: &str) -> &'static str {
@@ -73,6 +96,83 @@ fn spawn_decompressor(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     Ok((process, cmd))
+}
+
+pub(crate) fn get_compression_from_url(url: &str) -> Compression {
+    let path = url.split('?').next().unwrap_or(url);
+    let path = path.split('#').next().unwrap_or(path);
+    let extension = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    match extension.as_str() {
+        "gz" => Compression::Gzip,
+        "xz" => Compression::Xz,
+        "zst" | "zstd" => Compression::Zstd,
+        _ => Compression::None,
+    }
+}
+
+type DecompressorResult = (
+    mpsc::Receiver<Vec<u8>>,
+    std::thread::JoinHandle<Result<(), String>>,
+);
+
+pub(crate) fn start_inprocess_decompressor(
+    buffer_rx: ByteBoundedReceiver<Bytes>,
+    compression: Compression,
+    consumed_progress_tx: mpsc::UnboundedSender<u64>,
+    xz_memlimit_mb: u64,
+) -> Result<DecompressorResult, Box<dyn std::error::Error>> {
+    let (decompressed_tx, decompressed_rx) = mpsc::channel::<Vec<u8>>(8);
+
+    let handle = std::thread::Builder::new()
+        .name("decompressor".to_string())
+        .spawn(move || {
+            let channel_reader =
+                ChannelReader::new_byte_bounded(buffer_rx).with_progress(consumed_progress_tx);
+
+            let mut decoder: Box<dyn Read + Send> = match compression {
+                Compression::Xz => {
+                    let num_threads = std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(2);
+                    let memlimit = mb_to_bytes(xz_memlimit_mb);
+                    eprintln!(
+                        "XZ decompression: {} threads, memory limit {}MB",
+                        num_threads, xz_memlimit_mb
+                    );
+                    let stream = liblzma::stream::MtStreamBuilder::new()
+                        .threads(num_threads)
+                        .memlimit_threading(memlimit)
+                        .memlimit_stop(memlimit)
+                        .decoder()
+                        .map_err(|e| format!("Failed to create MT XZ decoder: {}", e))?;
+                    Box::new(liblzma::read::XzDecoder::new_stream(channel_reader, stream))
+                }
+                Compression::Gzip => Box::new(flate2::read::GzDecoder::new(channel_reader)),
+                Compression::None => Box::new(channel_reader),
+                Compression::Zstd => {
+                    return Err("Zstd in-process decompression is not supported".to_string());
+                }
+            };
+
+            let mut buf = vec![0u8; 8 * 1024 * 1024];
+            loop {
+                let n = decoder
+                    .read(&mut buf)
+                    .map_err(|e| format!("Decompression error: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                if decompressed_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    return Err("Writer task closed, stopping decompression".to_string());
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("Failed to spawn decompressor thread: {}", e).into()
+        })?;
+
+    Ok((decompressed_rx, handle))
 }
 
 pub(crate) async fn spawn_stderr_reader(

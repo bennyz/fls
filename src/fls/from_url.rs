@@ -1,12 +1,13 @@
+use futures_util::StreamExt;
 use std::io;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::fls::block_writer::AsyncBlockWriter;
 use crate::fls::byte_channel::byte_bounded_channel;
-use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
+use crate::fls::compression::Compression;
+use crate::fls::decompress::{get_compression_from_url, start_inprocess_decompressor};
 use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
@@ -33,19 +34,6 @@ async fn get_writer_error(handle: JoinHandle<io::Result<u64>>) -> Box<dyn std::e
     match await_writer_result(handle).await {
         Ok(_) => "Writer closed unexpectedly before download completed".into(),
         Err(e) => e.into(),
-    }
-}
-
-/// Get error from a prematurely finished decompressor writer handle
-///
-/// Called when decompressor_writer_handle.is_finished() returns true unexpectedly.
-async fn get_decompressor_error(
-    handle: JoinHandle<Result<(), String>>,
-) -> Box<dyn std::error::Error> {
-    match handle.await {
-        Ok(Ok(())) => "Decompressor stdin closed unexpectedly".into(),
-        Ok(Err(e)) => e.into(),
-        Err(e) => format!("Decompressor writer task panicked: {}", e).into(),
     }
 }
 
@@ -179,12 +167,14 @@ pub async fn flash_from_url(
     let http_options: HttpClientOptions = (&options).into();
     let client = setup_http_client(&http_options).await?;
 
-    let (mut decompressor, decompressor_name) = start_decompressor_process(url).await?;
-
-    // Extract stdio handles
-    let mut decompressor_stdin = decompressor.stdin.take().unwrap();
-    let decompressor_stdout = decompressor.stdout.take().unwrap();
-    let decompressor_stderr = decompressor.stderr.take().unwrap();
+    let compression = get_compression_from_url(url);
+    if compression == Compression::Zstd {
+        return Err("Zstd in-process decompression is not supported".into());
+    }
+    let is_compressed = compression != Compression::None;
+    if is_compressed {
+        eprintln!("Using decompressor: {} (in-process)", compression);
+    }
 
     // Create channels
     let (decompressed_progress_tx, mut decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
@@ -205,24 +195,43 @@ pub async fn flash_from_url(
         options.common.write_buffer_size_mb,
     )?;
 
-    // Spawn background task to read from decompressor and write to block device
+    // Create byte-bounded download buffer
+    let buffer_size_mb = options.common.buffer_size_mb;
+    let max_buffer_bytes = buffer_size_mb * 1024 * 1024;
+
+    println!(
+        "Using download buffer: {} MB (byte-bounded)",
+        buffer_size_mb
+    );
+
+    let (buffer_tx, buffer_rx) = byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, 4096);
+
+    // Channel for tracking bytes consumed from buffer by decompressor
+    let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) =
+        mpsc::unbounded_channel::<u64>();
+
+    // Start in-process decompressor thread
+    let (mut decompressed_rx, decompressor_handle) = start_inprocess_decompressor(
+        buffer_rx,
+        compression,
+        decompressor_written_progress_tx,
+        options.common.xz_memlimit_mb,
+    )?;
+
+    // Spawn background task to read decompressed data and write to block device
     let error_tx_clone = error_tx.clone();
     let debug = options.common.debug;
     let writer_handle = {
         let writer = block_writer;
         tokio::spawn(async move {
-            let mut stdout = decompressor_stdout;
-            let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
-
-            // Auto-detect sparse image format from initial data
             let mut detector = FormatDetector::new();
             let mut parser: Option<SparseParser> = None;
             let mut format_determined = false;
 
             loop {
-                let n = match stdout.read(&mut buffer).await {
-                    Ok(0) => {
-                        // EOF - check if we have incomplete format detection
+                let data = match decompressed_rx.recv().await {
+                    Some(data) => data,
+                    None => {
                         if !format_determined {
                             if let Some(buffered_data) = detector.finalize_at_eof() {
                                 if debug {
@@ -236,20 +245,15 @@ pub async fn flash_from_url(
                         }
                         break;
                     }
-                    Ok(n) => n,
-                    Err(e) => {
-                        let _ = error_tx_clone
-                            .send(format!("Error reading from decompressor stdout: {}", e));
-                        return Err(e);
-                    }
                 };
 
+                let n = data.len();
                 if decompressed_progress_tx.send(n as u64).is_err() {
                     break;
                 }
 
                 if !format_determined {
-                    match detector.process(&buffer[..n]) {
+                    match detector.process(&data) {
                         DetectionResult::NeedMoreData => {
                             if debug {
                                 eprintln!(
@@ -263,7 +267,7 @@ pub async fn flash_from_url(
                             consumed_bytes,
                             consumed_from_input,
                         } => {
-                            let remaining = &buffer[consumed_from_input..n];
+                            let remaining = &data[consumed_from_input..n];
                             parser = handle_detected_format(
                                 format,
                                 consumed_bytes,
@@ -281,22 +285,15 @@ pub async fn flash_from_url(
                         }
                     }
                 } else if let Some(ref mut p) = parser {
-                    process_sparse_data(p, &buffer[..n], &writer, &error_tx_clone, debug).await?;
+                    process_sparse_data(p, &data, &writer, &error_tx_clone, debug).await?;
                 } else {
-                    write_regular_data(buffer[..n].to_vec(), &writer, &error_tx_clone).await?;
+                    write_regular_data(data, &writer, &error_tx_clone).await?;
                 }
             }
 
-            // Close writer and get final bytes written
             writer.close().await
         })
     };
-
-    tokio::spawn(spawn_stderr_reader(
-        decompressor_stderr,
-        error_tx.clone(),
-        decompressor_name,
-    ));
 
     // Spawn message processors
     let error_processor = tokio::spawn(process_error_messages(error_rx));
@@ -304,57 +301,17 @@ pub async fn flash_from_url(
     // Main download loop with retry logic
     let mut progress =
         ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
-    // Set whether we're actually decompressing (not using cat for uncompressed files)
-    progress.set_is_compressed(decompressor_name != "cat");
+    progress.set_is_compressed(is_compressed);
     let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
     let mut bytes_sent_to_decompressor: u64 = 0;
     let mut retry_count = 0;
     let debug = options.common.debug;
 
-    use futures_util::StreamExt;
-
-    // Create byte-bounded download buffer (shared across all retry attempts)
-    let buffer_size_mb = options.common.buffer_size_mb;
-    let max_buffer_bytes = buffer_size_mb * 1024 * 1024;
-
-    println!(
-        "Using download buffer: {} MB (byte-bounded)",
-        buffer_size_mb
-    );
-
-    // Create persistent byte-bounded channel for download buffering (lives across retries)
-    // max_items=4096 prevents unbounded item queuing; byte budget is the real bound
-    let (buffer_tx, mut buffer_rx) = byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, 4096);
-
-    // Channels for tracking bytes actually written to decompressor
-    let (decompressor_written_progress_tx, mut decompressor_written_progress_rx) =
-        mpsc::unbounded_channel::<u64>();
-
-    // Spawn persistent task to write buffered chunks to decompressor
-    let decompressor_writer_handle = tokio::spawn(async move {
-        while let Some(chunk) = buffer_rx.recv().await {
-            let chunk_len = chunk.len() as u64;
-            if let Err(e) = decompressor_stdin.write_all(&chunk).await {
-                return Err(format!("Error writing to decompressor stdin: {}", e));
-            }
-            // Notify that bytes were written to decompressor
-            let _ = decompressor_written_progress_tx.send(chunk_len);
-        }
-        // Close decompressor stdin when channel is closed
-        Ok::<(), String>(())
-    });
-
     loop {
-        // Check if writer or decompressor has failed before attempting download/retry
         if writer_handle.is_finished() {
             eprintln!();
             eprintln!("Writer task has terminated, stopping download");
             return Err(get_writer_error(writer_handle).await);
-        }
-        if decompressor_writer_handle.is_finished() {
-            eprintln!();
-            eprintln!("Decompressor writer task has terminated, stopping download");
-            return Err(get_decompressor_error(decompressor_writer_handle).await);
         }
 
         // Resume from the HTTP download position, not the decompressor write position
@@ -414,20 +371,10 @@ pub async fn flash_from_url(
                             // Send to buffer - detect if it's blocking
                             let send_start = std::time::Instant::now();
                             if buffer_tx.send(chunk).await.is_err() {
-                                // Check if writer or decompressor has failed
                                 if writer_handle.is_finished() {
                                     eprintln!();
                                     eprintln!("Writer task has terminated unexpectedly");
                                     return Err(get_writer_error(writer_handle).await);
-                                }
-                                if decompressor_writer_handle.is_finished() {
-                                    eprintln!();
-                                    eprintln!(
-                                        "Decompressor writer task has terminated unexpectedly"
-                                    );
-                                    return Err(
-                                        get_decompressor_error(decompressor_writer_handle).await
-                                    );
                                 }
                                 connection_error =
                                     Some(DownloadError::Other("Buffer channel closed".to_string()));
@@ -500,16 +447,10 @@ pub async fn flash_from_url(
 
         // If connection broke, retry
         if connection_broken {
-            // First check if writer or decompressor has failed - if so, don't retry
             if writer_handle.is_finished() {
                 eprintln!();
                 eprintln!("Connection interrupted and writer task has terminated");
                 return Err(get_writer_error(writer_handle).await);
-            }
-            if decompressor_writer_handle.is_finished() {
-                eprintln!();
-                eprintln!("Connection interrupted and decompressor writer task has terminated");
-                return Err(get_decompressor_error(decompressor_writer_handle).await);
             }
 
             if let Some(e) = connection_error {
@@ -554,120 +495,21 @@ pub async fn flash_from_url(
     // Close buffer channel to signal end of download
     drop(buffer_tx);
 
-    // Poll for decompressor writer completion while showing progress
-    loop {
-        // Update progress from all channels
-        let mut updated = false;
-
-        while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
-            progress.bytes_sent_to_decompressor += written_len;
-            updated = true;
-        }
-
-        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
-            progress.bytes_decompressed += byte_count;
-            updated = true;
-        }
-
-        while let Ok(written_bytes) = written_progress_rx.try_recv() {
-            progress.bytes_written = written_bytes;
-            updated = true;
-        }
-
-        if updated {
-            let _ = progress.update_progress(None, update_interval, false);
-        }
-
-        // Check if decompressor writer task is done
-        if decompressor_writer_handle.is_finished() {
-            break;
-        }
-
-        // Small sleep to avoid busy waiting
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    // Get the result from the decompressor writer task
-    if let Err(e) = decompressor_writer_handle
+    let decompressor_result = tokio::task::spawn_blocking(move || decompressor_handle.join())
         .await
-        .map_err(|e| e.to_string())
-        .and_then(|r| r)
-    {
+        .map_err(|_| "Decompressor task panicked")?
+        .map_err(|_| "Decompressor thread panicked")?;
+
+    if let Err(e) = decompressor_result {
         eprintln!();
         return Err(e.into());
     }
 
-    // Update any remaining progress
     while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
         progress.bytes_decompressed += byte_count;
     }
-
-    // Check if decompressor has already finished
-    let decompressor_already_done = match decompressor.try_wait() {
-        Ok(Some(status)) => {
-            if !status.success() {
-                eprintln!();
-                return Err(format!(
-                    "{} process failed with status: {:?}",
-                    decompressor_name,
-                    status.code()
-                )
-                .into());
-            }
-            true
-        }
-        Ok(None) => false,
-        Err(e) => {
-            eprintln!();
-            return Err(e.into());
-        }
-    };
-
-    // Only wait if decompressor is not already done
-    if !decompressor_already_done {
-        // Poll for decompressor completion while showing progress
-        loop {
-            // Update progress from channels
-            let mut updated = false;
-
-            while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
-                progress.bytes_decompressed += byte_count;
-                updated = true;
-            }
-
-            while let Ok(written_bytes) = written_progress_rx.try_recv() {
-                progress.bytes_written = written_bytes;
-                updated = true;
-            }
-
-            if updated {
-                let _ = progress.update_progress(None, update_interval, false);
-            }
-
-            // Check if decompressor is done (non-blocking check)
-            match decompressor.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        eprintln!();
-                        return Err(format!(
-                            "{} process failed with status: {:?}",
-                            decompressor_name,
-                            status.code()
-                        )
-                        .into());
-                    }
-                    break;
-                }
-                Ok(None) => {
-                    // Still running, sleep briefly
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(e) => {
-                    eprintln!();
-                    return Err(e.into());
-                }
-            }
-        }
+    while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
+        progress.bytes_sent_to_decompressor += written_len;
     }
 
     // Capture the decompression rate and duration at completion

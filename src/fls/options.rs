@@ -3,6 +3,8 @@ use std::path::PathBuf;
 pub const DEFAULT_MAX_RETRIES: usize = 10;
 pub const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
+pub const DEFAULT_XZ_MEMLIMIT_MB: u64 = 256;
+
 /// Common options shared between URL and OCI flash operations
 #[derive(Debug, Clone)]
 pub struct FlashOptions {
@@ -16,6 +18,7 @@ pub struct FlashOptions {
     pub progress_interval_secs: f64,
     pub newline_progress: bool,
     pub show_memory: bool,
+    pub xz_memlimit_mb: u64,
 }
 
 impl Default for FlashOptions {
@@ -31,6 +34,7 @@ impl Default for FlashOptions {
             progress_interval_secs: 0.5,
             newline_progress: false,
             show_memory: false,
+            xz_memlimit_mb: DEFAULT_XZ_MEMLIMIT_MB,
         }
     }
 }

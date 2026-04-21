@@ -13,7 +13,6 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use xz2::read::XzDecoder;
 
 use crate::fls::byte_channel::{byte_bounded_channel, ByteBoundedReceiver, ByteBoundedSender};
 use crate::fls::decompress::start_decompressor_for_compression;
@@ -454,6 +453,7 @@ async fn stream_blob_to_tar_files(
         .into_owned_fd()
         .map_err(|e| format!("Failed to convert decompressor stdout: {}", e))?
         .into();
+    let xz_memlimit_mb = options.common.xz_memlimit_mb;
     let writer_handle =
         tokio::task::spawn_blocking(move || -> Result<HashMap<String, PathBuf>, String> {
             let reader = std::io::BufReader::new(std_stdout);
@@ -488,7 +488,14 @@ async fn stream_blob_to_tar_files(
                             })?;
                         }
                         Compression::Xz => {
-                            let mut decoder = XzDecoder::new(combined);
+                            let mut decoder =
+                                crate::fls::decompress::create_xz_decoder(combined, xz_memlimit_mb)
+                                    .map_err(|e| {
+                                        format!(
+                                            "Failed to create XZ decoder for {}: {}",
+                                            file_name, e
+                                        )
+                                    })?;
                             std::io::copy(&mut decoder, &mut file).map_err(|e| {
                                 format!("Failed to write {}: {}", output_path.display(), e)
                             })?;
@@ -1954,6 +1961,7 @@ pub async fn flash_from_oci(
     // Spawn blocking task: HTTP rx -> gzip -> tar -> tar tx
     let file_pattern = options.file_pattern.clone();
     let debug = options.common.debug;
+    let xz_memlimit_mb = options.common.xz_memlimit_mb;
     let tar_extractor_handle = tokio::task::spawn_blocking(move || {
         extract_tar_archive_from_stream(
             http_rx,
@@ -1962,6 +1970,7 @@ pub async fn flash_from_oci(
             compression,
             compression_type,
             debug,
+            xz_memlimit_mb,
         )
     });
 
@@ -1996,6 +2005,7 @@ fn extract_tar_stream_impl<R: Read + Send>(
     tar_tx: mpsc::Sender<Vec<u8>>,
     file_pattern: Option<&str>,
     debug: bool,
+    xz_memlimit_mb: u64,
 ) -> Result<(), String> {
     if debug {
         eprintln!("[DEBUG] Tar extractor starting");
@@ -2032,8 +2042,8 @@ fn extract_tar_stream_impl<R: Read + Send>(
         if debug {
             eprintln!("[DEBUG] Auto-detected XZ compression from magic bytes - decompressing for tar extraction");
         }
-        // Decompress XZ before tar extraction (like gzip)
-        let xz_decoder = XzDecoder::new(magic_reader);
+        let xz_decoder = crate::fls::decompress::create_xz_decoder(magic_reader, xz_memlimit_mb)
+            .map_err(|e| format!("Failed to create XZ decoder: {}", e))?;
         Box::new(xz_decoder)
     } else {
         if debug {
@@ -2567,6 +2577,7 @@ fn extract_tar_archive_from_stream(
     compression: LayerCompression,
     compression_type: Compression,
     debug: bool,
+    xz_memlimit_mb: u64,
 ) -> Result<(), String> {
     let reader = ChannelReader::new_byte_bounded(http_rx);
 
@@ -2611,7 +2622,13 @@ fn extract_tar_archive_from_stream(
         }
     };
 
-    extract_tar_stream_impl(decompressed_reader, tar_tx, file_pattern, debug)
+    extract_tar_stream_impl(
+        decompressed_reader,
+        tar_tx,
+        file_pattern,
+        debug,
+        xz_memlimit_mb,
+    )
 }
 
 #[cfg(test)]

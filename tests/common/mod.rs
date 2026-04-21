@@ -1,8 +1,8 @@
 // Shared test utilities
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use liblzma::write::XzEncoder;
 use std::io::Write;
-use xz2::write::XzEncoder;
 
 /// Generate deterministic test data of a given size
 #[allow(dead_code)]
