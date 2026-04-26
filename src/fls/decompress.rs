@@ -7,7 +7,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-fn mb_to_bytes(mb: u64) -> u64 {
+pub(crate) fn mb_to_bytes(mb: u64) -> u64 {
     mb.saturating_mul(1024 * 1024)
 }
 
@@ -23,6 +23,29 @@ pub(crate) fn create_xz_decoder<R: Read>(
         )
     })?;
     Ok(liblzma::read::XzDecoder::new_stream(reader, stream))
+}
+
+pub(crate) fn create_mt_xz_decoder<R: Read + Send + 'static>(
+    reader: R,
+    xz_memlimit_mb: u64,
+) -> Result<Box<dyn Read + Send>, String> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(2);
+    let memlimit = mb_to_bytes(xz_memlimit_mb);
+    eprintln!(
+        "XZ decompression: {} threads, memory limit {}MB",
+        num_threads, xz_memlimit_mb
+    );
+    let stream = liblzma::stream::MtStreamBuilder::new()
+        .threads(num_threads)
+        .memlimit_threading(memlimit)
+        .memlimit_stop(memlimit)
+        .decoder()
+        .map_err(|e| format!("Failed to create MT XZ decoder: {}", e))?;
+    Ok(Box::new(liblzma::read::XzDecoder::new_stream(
+        reader, stream,
+    )))
 }
 
 /// Determines the appropriate decompression command based on URL extension
@@ -130,23 +153,7 @@ pub(crate) fn start_inprocess_decompressor(
                 ChannelReader::new_byte_bounded(buffer_rx).with_progress(consumed_progress_tx);
 
             let mut decoder: Box<dyn Read + Send> = match compression {
-                Compression::Xz => {
-                    let num_threads = std::thread::available_parallelism()
-                        .map(|n| n.get() as u32)
-                        .unwrap_or(2);
-                    let memlimit = mb_to_bytes(xz_memlimit_mb);
-                    eprintln!(
-                        "XZ decompression: {} threads, memory limit {}MB",
-                        num_threads, xz_memlimit_mb
-                    );
-                    let stream = liblzma::stream::MtStreamBuilder::new()
-                        .threads(num_threads)
-                        .memlimit_threading(memlimit)
-                        .memlimit_stop(memlimit)
-                        .decoder()
-                        .map_err(|e| format!("Failed to create MT XZ decoder: {}", e))?;
-                    Box::new(liblzma::read::XzDecoder::new_stream(channel_reader, stream))
-                }
+                Compression::Xz => create_mt_xz_decoder(channel_reader, xz_memlimit_mb)?,
                 Compression::Gzip => Box::new(flate2::read::GzDecoder::new(channel_reader)),
                 Compression::None => Box::new(channel_reader),
                 Compression::Zstd => {
