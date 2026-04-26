@@ -72,6 +72,9 @@ enum Commands {
         /// Show memory statistics in progress display
         #[arg(long)]
         show_memory: bool,
+        /// XZ decompression memory limit in MB (exceeds = single-thread fallback, then error)
+        #[arg(long, default_value = "256")]
+        xz_memlimit: u64,
         /// Registry username for OCI authentication
         #[arg(short = 'u', long, env = "FLS_REGISTRY_USERNAME")]
         username: Option<String>,
@@ -136,6 +139,7 @@ async fn main() {
             username,
             password,
             file_pattern,
+            xz_memlimit,
         } => {
             // Detect URL scheme to determine handler
             let is_oci = url.starts_with("oci://");
@@ -188,6 +192,7 @@ async fn main() {
                         progress_interval_secs: progress_interval,
                         newline_progress,
                         show_memory,
+                        xz_memlimit_mb: xz_memlimit,
                     },
                     username,
                     password,
@@ -265,6 +270,7 @@ async fn main() {
                         progress_interval_secs: progress_interval,
                         newline_progress,
                         show_memory,
+                        xz_memlimit_mb: xz_memlimit,
                     },
                     max_retries,
                     retry_delay_secs: retry_delay,

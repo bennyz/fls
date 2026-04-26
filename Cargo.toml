@@ -20,7 +20,7 @@ nix = { version = "0.29", features = ["ioctl"] }
 # Enable vendored OpenSSL for cross-compilation to musl targets
 # This ensures OpenSSL builds from source with musl compatibility
 openssl = { version = "0.10", features = ["vendored"] }
-xz2 = "0.1"
+liblzma = { version = "0.4", features = ["parallel"] }
 
 [dev-dependencies]
 http-body = "1.0.1"

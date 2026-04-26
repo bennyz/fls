@@ -13,7 +13,6 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use xz2::read::XzDecoder;
 
 use crate::fls::byte_channel::{byte_bounded_channel, ByteBoundedReceiver, ByteBoundedSender};
 use crate::fls::decompress::start_decompressor_for_compression;
@@ -57,7 +56,7 @@ struct DownloadContext {
 struct RawDiskDownloadParams {
     http_tx: ByteBoundedSender<bytes::Bytes>,
     writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
-    external_decompressor: Option<tokio::process::Child>,
+    is_compressed: bool,
     decompressed_progress_rx: mpsc::UnboundedReceiver<u64>,
     raw_written_progress_rx: mpsc::UnboundedReceiver<u64>,
 }
@@ -68,12 +67,6 @@ struct ProcessingHandles {
     decompressor_writer_handle: tokio::task::JoinHandle<Result<(), String>>,
     error_processor: tokio::task::JoinHandle<()>,
     tar_extractor_handle: tokio::task::JoinHandle<Result<(), String>>,
-}
-
-/// Components returned by external decompressor pipeline setup
-struct ExternalDecompressorPipeline {
-    writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
-    decompressor: tokio::process::Child,
 }
 
 /// Components returned by pipeline setup
@@ -454,6 +447,7 @@ async fn stream_blob_to_tar_files(
         .into_owned_fd()
         .map_err(|e| format!("Failed to convert decompressor stdout: {}", e))?
         .into();
+    let xz_memlimit_mb = options.common.xz_memlimit_mb;
     let writer_handle =
         tokio::task::spawn_blocking(move || -> Result<HashMap<String, PathBuf>, String> {
             let reader = std::io::BufReader::new(std_stdout);
@@ -488,7 +482,14 @@ async fn stream_blob_to_tar_files(
                             })?;
                         }
                         Compression::Xz => {
-                            let mut decoder = XzDecoder::new(combined);
+                            let mut decoder =
+                                crate::fls::decompress::create_xz_decoder(combined, xz_memlimit_mb)
+                                    .map_err(|e| {
+                                        format!(
+                                            "Failed to create XZ decoder for {}: {}",
+                                            file_name, e
+                                        )
+                                    })?;
                             std::io::copy(&mut decoder, &mut file).map_err(|e| {
                                 format!("Failed to write {}: {}", output_path.display(), e)
                             })?;
@@ -1416,151 +1417,22 @@ async fn coordinate_download_and_processing(
     Ok(())
 }
 
-/// Setup external decompressor pipeline for XZ compression
-async fn setup_external_decompressor_pipeline(
-    http_rx: ByteBoundedReceiver<bytes::Bytes>,
-    block_writer: AsyncBlockWriter,
-    decompressed_progress_tx: mpsc::UnboundedSender<u64>,
-    debug: bool,
-) -> Result<ExternalDecompressorPipeline, Box<dyn std::error::Error>> {
-    // XZ: Use external xzcat process
-    let (mut decompressor, decompressor_name) = start_decompressor_process("disk.img.xz").await?;
-
-    let decompressor_stdin = decompressor.stdin.take().unwrap();
-    let decompressor_stdout = decompressor.stdout.take().unwrap();
-    let decompressor_stderr = decompressor.stderr.take().unwrap();
-
-    let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
-
-    // Spawn stderr reader
-    tokio::spawn(spawn_stderr_reader(
-        decompressor_stderr,
-        error_tx.clone(),
-        decompressor_name,
-    ));
-
-    // Spawn error processor
-    tokio::spawn(process_error_messages(error_rx));
-
-    // Spawn blocking task: read from channel and write to xzcat stdin
-    // First, create a sync file handle from the async stdin
-    #[cfg(unix)]
-    let stdin_fd = {
-        use std::os::unix::io::{AsRawFd, FromRawFd};
-        let raw_fd = decompressor_stdin.as_raw_fd();
-        // Duplicate the fd so we can use it in blocking context
-        let dup_fd = unsafe { libc::dup(raw_fd) };
-        if dup_fd == -1 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: dup_fd is a valid file descriptor (we checked above)
-        unsafe { std::fs::File::from_raw_fd(dup_fd) }
-    };
-    #[cfg(not(unix))]
-    let stdin_fd: std::fs::File = {
-        return Err("XZ streaming decompression is not supported on non-unix platforms".into());
-    };
-
-    // Drop the original async stdin (the dup'd fd still points to the pipe)
-    drop(decompressor_stdin);
-
-    let stdin_writer_handle = {
-        tokio::task::spawn_blocking(move || {
-            use std::io::Write as _;
-            let reader = ChannelReader::new_byte_bounded(http_rx);
-            let mut reader = reader;
-            let mut stdin = stdin_fd;
-            let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
-
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        if let Err(e) = stdin.write_all(&buffer[..n]) {
-                            return Err(format!("Error writing to xzcat: {}", e));
-                        }
-                    }
-                    Err(e) => return Err(format!("Error reading stream: {}", e)),
-                }
-            }
-
-            drop(stdin);
-            Ok::<(), String>(())
-        })
-    };
-
-    // Spawn task: xzcat stdout -> block writer with sparse detection
-    let writer = block_writer;
-    let progress_tx = decompressed_progress_tx;
-    let writer_handle = tokio::spawn(async move {
-        let mut stdout = decompressor_stdout;
-        let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
-
-        // Auto-detect sparse image format from initial data
-        let mut detector = FormatDetector::new();
-        let mut parser: Option<SparseParser> = None;
-        let mut format_determined = false;
-
-        loop {
-            let n = match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
-                Ok(0) => {
-                    finalize_format_at_eof(&mut detector, format_determined, &writer, debug)
-                        .await?;
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => return Err(e),
-            };
-
-            let _ = progress_tx.send(n as u64);
-
-            process_buffer_with_format_detection(
-                &buffer,
-                n,
-                &mut detector,
-                &mut parser,
-                &mut format_determined,
-                &writer,
-                debug,
-            )
-            .await?;
-        }
-
-        // Wait for stdin writer to finish and propagate any errors
-        stdin_writer_handle
-            .await
-            .map_err(|e| std::io::Error::other(format!("Stdin writer task failed: {}", e)))?
-            .map_err(|e| std::io::Error::other(format!("Stdin writer error: {}", e)))?;
-
-        writer.close().await
-    });
-
-    Ok(ExternalDecompressorPipeline {
-        writer_handle,
-        decompressor,
-    })
-}
-
-/// Setup in-process decompression pipeline for Gzip or None compression
 async fn setup_inprocess_decompression_pipeline(
     http_rx: ByteBoundedReceiver<bytes::Bytes>,
     block_writer: AsyncBlockWriter,
     decompressed_progress_tx: mpsc::UnboundedSender<u64>,
     compression_type: Compression,
     debug: bool,
+    xz_memlimit_mb: u64,
 ) -> Result<tokio::task::JoinHandle<Result<u64, std::io::Error>>, Box<dyn std::error::Error>> {
-    // Gzip or None: decompress in-process and write directly to block writer
     let writer = block_writer;
     let progress_tx = decompressed_progress_tx;
 
-    // Create an async channel for decompressed data
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(16);
 
-    // Spawn blocking task: read, decompress, send to async channel
     let reader_handle = tokio::task::spawn_blocking(move || {
         let reader = ChannelReader::new_byte_bounded(http_rx);
 
-        // Apply in-process gzip decompression if needed
         let processed_reader: Box<dyn std::io::Read + Send> = match compression_type {
             Compression::Gzip => {
                 if debug {
@@ -1568,7 +1440,13 @@ async fn setup_inprocess_decompression_pipeline(
                 }
                 Box::new(flate2::read::GzDecoder::new(reader))
             }
-            _ => Box::new(reader),
+            Compression::Xz => {
+                crate::fls::decompress::create_mt_xz_decoder(reader, xz_memlimit_mb)?
+            }
+            Compression::None => Box::new(reader),
+            Compression::Zstd => {
+                return Err("Zstd in-process decompression is not supported".to_string());
+            }
         };
 
         let mut reader = processed_reader;
@@ -1650,7 +1528,7 @@ async fn coordinate_raw_disk_download(
     let mut progress =
         ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
     progress.set_content_length(Some(layer_size));
-    progress.set_is_compressed(params.external_decompressor.is_some());
+    progress.set_is_compressed(params.is_compressed);
     progress.bytes_received = initial_buffer.len() as u64;
     let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
 
@@ -1764,24 +1642,6 @@ async fn coordinate_raw_disk_download(
     let elapsed = progress.start_time.elapsed();
     progress.decompress_duration = Some(elapsed);
     progress.write_duration = Some(elapsed);
-
-    // Wait for external decompressor process and check exit status
-    if let Some(mut decompressor) = params.external_decompressor {
-        match decompressor.wait().await {
-            Ok(status) => {
-                if !status.success() {
-                    return Err(format!(
-                        "Decompressor process failed with exit code: {:?}",
-                        status.code()
-                    )
-                    .into());
-                }
-            }
-            Err(e) => {
-                return Err(format!("Failed to wait for decompressor process: {}", e).into());
-            }
-        }
-    }
 
     // Final progress update
     let _ = progress.update_progress(Some(layer_size), update_interval, true);
@@ -1954,6 +1814,7 @@ pub async fn flash_from_oci(
     // Spawn blocking task: HTTP rx -> gzip -> tar -> tar tx
     let file_pattern = options.file_pattern.clone();
     let debug = options.common.debug;
+    let xz_memlimit_mb = options.common.xz_memlimit_mb;
     let tar_extractor_handle = tokio::task::spawn_blocking(move || {
         extract_tar_archive_from_stream(
             http_rx,
@@ -1962,6 +1823,7 @@ pub async fn flash_from_oci(
             compression,
             compression_type,
             debug,
+            xz_memlimit_mb,
         )
     });
 
@@ -1996,6 +1858,7 @@ fn extract_tar_stream_impl<R: Read + Send>(
     tar_tx: mpsc::Sender<Vec<u8>>,
     file_pattern: Option<&str>,
     debug: bool,
+    xz_memlimit_mb: u64,
 ) -> Result<(), String> {
     if debug {
         eprintln!("[DEBUG] Tar extractor starting");
@@ -2032,8 +1895,8 @@ fn extract_tar_stream_impl<R: Read + Send>(
         if debug {
             eprintln!("[DEBUG] Auto-detected XZ compression from magic bytes - decompressing for tar extraction");
         }
-        // Decompress XZ before tar extraction (like gzip)
-        let xz_decoder = XzDecoder::new(magic_reader);
+        let xz_decoder = crate::fls::decompress::create_xz_decoder(magic_reader, xz_memlimit_mb)
+            .map_err(|e| format!("Failed to create XZ decoder: {}", e))?;
         Box::new(xz_decoder)
     } else {
         if debug {
@@ -2510,48 +2373,31 @@ async fn flash_raw_disk_image_directly(
         byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, buffer_capacity);
     let (decompressed_progress_tx, decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
 
-    // For gzip and none, we can decompress in-process and write directly to block writer
-    // For XZ, we need the external xzcat process
-    let needs_external_decompressor = compression_type == Compression::Xz;
+    if compression_type == Compression::Zstd {
+        return Err("Zstd in-process decompression is not supported".into());
+    }
 
     if options.common.debug {
         eprintln!(
-            "[DEBUG] Compression type: {:?}, using external decompressor: {}",
-            compression_type, needs_external_decompressor
+            "[DEBUG] Compression type: {:?}, using in-process decompressor",
+            compression_type
         );
     }
 
-    // Spawn the processing pipeline based on compression type
-    let (writer_handle, external_decompressor) = if needs_external_decompressor {
-        // XZ: Use external xzcat process
-        let pipeline = setup_external_decompressor_pipeline(
-            http_rx,
-            block_writer,
-            decompressed_progress_tx,
-            options.common.debug,
-        )
-        .await?;
+    let writer_handle = setup_inprocess_decompression_pipeline(
+        http_rx,
+        block_writer,
+        decompressed_progress_tx,
+        compression_type,
+        options.common.debug,
+        options.common.xz_memlimit_mb,
+    )
+    .await?;
 
-        (pipeline.writer_handle, Some(pipeline.decompressor))
-    } else {
-        // Gzip or None: decompress in-process and write directly to block writer
-        let handle = setup_inprocess_decompression_pipeline(
-            http_rx,
-            block_writer,
-            decompressed_progress_tx,
-            compression_type,
-            options.common.debug,
-        )
-        .await?;
-
-        (handle, None)
-    };
-
-    // Coordinate download and processing
     let params = RawDiskDownloadParams {
         http_tx,
         writer_handle,
-        external_decompressor,
+        is_compressed: compression_type != Compression::None,
         decompressed_progress_rx,
         raw_written_progress_rx,
     };
@@ -2567,6 +2413,7 @@ fn extract_tar_archive_from_stream(
     compression: LayerCompression,
     compression_type: Compression,
     debug: bool,
+    xz_memlimit_mb: u64,
 ) -> Result<(), String> {
     let reader = ChannelReader::new_byte_bounded(http_rx);
 
@@ -2611,7 +2458,13 @@ fn extract_tar_archive_from_stream(
         }
     };
 
-    extract_tar_stream_impl(decompressed_reader, tar_tx, file_pattern, debug)
+    extract_tar_stream_impl(
+        decompressed_reader,
+        tar_tx,
+        file_pattern,
+        debug,
+        xz_memlimit_mb,
+    )
 }
 
 #[cfg(test)]

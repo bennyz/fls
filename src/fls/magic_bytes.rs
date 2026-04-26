@@ -143,8 +143,8 @@ fn decompress_gzip_sample(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decompress a sample of XZ data to analyze content type
 fn decompress_xz_sample(data: &[u8]) -> Result<Vec<u8>, String> {
+    use liblzma::read::XzDecoder;
     use std::io::Read;
-    use xz2::read::XzDecoder;
 
     let mut decoder = XzDecoder::new(data);
     let mut buffer = vec![0u8; 8192]; // Decompress up to 8KB
