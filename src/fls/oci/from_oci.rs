@@ -18,10 +18,12 @@ use crate::fls::byte_channel::{byte_bounded_channel, ByteBoundedReceiver, ByteBo
 use crate::fls::decompress::start_decompressor_for_compression;
 use crate::fls::download_error::{handle_download_retry, DownloadError};
 
-use super::manifest::{LayerCompression, Manifest};
+use super::manifest::{FlashableArtifact, LayerCompression, Manifest};
 use super::reference::ImageReference;
 use super::registry::RegistryClient;
-use crate::fls::automotive::annotations as automotive_annotations;
+use crate::fls::annotation_schema::{
+    effective_schemas, resolve_annotation_schema, searched_keys_display,
+};
 use crate::fls::block_writer::AsyncBlockWriter;
 use crate::fls::compression::Compression;
 use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
@@ -586,7 +588,7 @@ pub async fn extract_files_from_oci_image_to_dir(
     Ok(map)
 }
 
-/// Extract files based on layer annotations for automotive images and write to output_dir
+/// Extract files based on layer annotations and write to output_dir
 pub async fn extract_files_by_annotations_to_dir(
     image: &str,
     options: &OciOptions,
@@ -594,13 +596,24 @@ pub async fn extract_files_by_annotations_to_dir(
 ) -> Result<HashMap<String, PathBuf>, Box<dyn std::error::Error>> {
     let (client, manifest) = connect_and_resolve(image, options).await?;
 
-    // Get layers and extract from each based on annotations
     let layers = manifest.get_layers()?;
+    let schemas = effective_schemas(&options.annotation_schemas);
+    let schema = resolve_annotation_schema(layers, schemas).ok_or_else(|| {
+        format!(
+            "No partitions found in OCI annotations. Searched for partition keys: {}",
+            searched_keys_display(schemas)
+        )
+    })?;
+    println!(
+        "Using annotation schema: {} ({})",
+        schema.name, schema.partition_key
+    );
+
     let mut partition_files = HashMap::new();
 
     for layer in layers {
         if let Some(ref annotations) = layer.annotations {
-            if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
+            if let Some(partition) = annotations.get(schema.partition_key) {
                 ensure_supported_layer_compression(layer.compression(), &layer.media_type)?;
                 let sanitized_name = sanitize_partition_name(partition)
                     .map_err(|e| format!("Invalid partition annotation '{}': {}", partition, e))?;
@@ -629,7 +642,10 @@ pub async fn extract_files_by_annotations_to_dir(
     Ok(partition_files)
 }
 
-fn parse_default_partitions(manifest: &Manifest) -> Result<Option<HashSet<String>>, String> {
+fn parse_default_partitions(
+    manifest: &Manifest,
+    schema: &crate::fls::annotation_schema::AnnotationSchema,
+) -> Result<Option<HashSet<String>>, String> {
     let Manifest::Image(image) = manifest else {
         return Ok(None);
     };
@@ -638,7 +654,7 @@ fn parse_default_partitions(manifest: &Manifest) -> Result<Option<HashSet<String
         return Ok(None);
     };
 
-    let Some(raw) = annotations.get(automotive_annotations::DEFAULT_PARTITIONS) else {
+    let Some(raw) = annotations.get(schema.default_partitions_key) else {
         return Ok(None);
     };
 
@@ -656,7 +672,7 @@ fn parse_default_partitions(manifest: &Manifest) -> Result<Option<HashSet<String
     if partitions.is_empty() {
         return Err(format!(
             "Default partition annotation '{}' is empty",
-            automotive_annotations::DEFAULT_PARTITIONS
+            schema.default_partitions_key
         ));
     }
 
@@ -700,14 +716,24 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
 ) -> Result<Option<HashMap<String, PathBuf>>, Box<dyn std::error::Error>> {
     let (client, manifest) = connect_and_resolve(image, options).await?;
 
-    let default_partitions = parse_default_partitions(&manifest)
-        .map_err(|e| format!("Invalid default partitions annotation: {}", e))?;
+    let layers = manifest.get_layers()?;
+    let schemas = effective_schemas(&options.annotation_schemas);
+    let schema = resolve_annotation_schema(layers, schemas);
+
+    let default_partitions = if let Some(schema) = schema {
+        println!(
+            "Using annotation schema: {} ({})",
+            schema.name, schema.partition_key
+        );
+        parse_default_partitions(&manifest, schema)
+            .map_err(|e| format!("Invalid default partitions annotation: {}", e))?
+    } else {
+        None
+    };
     if let Some(ref partitions) = default_partitions {
         println!("Using default partitions from manifest: {:?}", partitions);
     }
 
-    // Get layers and build lookup tables
-    let layers = manifest.get_layers()?;
     let mut partition_files = HashMap::new();
     let mut title_to_layer: HashMap<String, &super::manifest::Descriptor> = HashMap::new();
     let mut title_to_path = HashMap::new();
@@ -735,7 +761,8 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
                 }
             }
 
-            if let Some(partition) = annotations.get(automotive_annotations::PARTITION_ANNOTATION) {
+            let partition_key = schema.map(|s| s.partition_key);
+            if let Some(partition) = partition_key.and_then(|k| annotations.get(k)) {
                 has_partition_annotations = true;
                 available_partitions.insert(partition.clone());
                 if overridden_partitions.contains(partition) {
@@ -772,10 +799,11 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
 
     if !has_partition_annotations && title_to_layer.is_empty() {
         if overrides.is_empty() {
-            return Err(
-                "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations"
-                    .into(),
-            );
+            return Err(format!(
+                "No partitions found in OCI annotations. Searched for partition keys: {}",
+                searched_keys_display(schemas)
+            )
+            .into());
         }
         return Ok(None);
     }
@@ -837,10 +865,11 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
             )
             .into());
         }
-        return Err(
-            "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations"
-                .into(),
-        );
+        return Err(format!(
+            "No partitions found in OCI annotations. Searched for partition keys: {}",
+            searched_keys_display(schemas)
+        )
+        .into());
     }
 
     Ok(Some(partition_files))
@@ -1673,13 +1702,11 @@ pub async fn flash_from_oci(
     let layer = manifest.get_single_layer()?;
 
     // Validate that the selected layer is a flashable disk image
-    if !layer
-        .media_type
-        .starts_with("application/vnd.automotive.disk")
-    {
+    if !FlashableArtifact::is_flashable(&layer.media_type) {
         return Err(format!(
-            "Layer media type '{}' is not a flashable disk image",
-            layer.media_type
+            "Layer media type '{}' is not a flashable disk image. Supported: {}",
+            layer.media_type,
+            FlashableArtifact::supported_types().join(", ")
         )
         .into());
     }

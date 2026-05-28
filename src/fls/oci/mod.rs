@@ -4,7 +4,7 @@
 /// decompresses and extracts disk images directly to block devices.
 mod auth;
 mod from_oci;
-mod manifest;
+pub(crate) mod manifest;
 mod reference;
 mod registry;
 

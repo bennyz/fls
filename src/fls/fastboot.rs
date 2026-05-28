@@ -88,6 +88,7 @@ fn build_oci_options(options: &FastbootOptions) -> crate::fls::options::OciOptio
         file_pattern: None,
         max_retries: crate::fls::options::DEFAULT_MAX_RETRIES,
         retry_delay_secs: crate::fls::options::DEFAULT_RETRY_DELAY_SECS,
+        annotation_schemas: vec![],
     }
 }
 
@@ -299,21 +300,24 @@ async fn extract_files_by_auto_detection_to_dir(
     let oci_options = build_oci_options(options);
 
     // Use annotation-aware extraction to get files from correct layers
-    let partition_files =
-        super::oci::extract_files_by_annotations_with_overrides_to_dir(
-            image_ref,
-            &oci_options,
-            output_dir,
-            &[],
-        )
-        .await
-        .map_err(|e| format!("Annotation-based extraction failed: {}", e))?
-        .ok_or_else(|| {
-            "No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations".to_string()
-        })?;
+    let partition_files = super::oci::extract_files_by_annotations_with_overrides_to_dir(
+        image_ref,
+        &oci_options,
+        output_dir,
+        &[],
+    )
+    .await
+    .map_err(|e| format!("Annotation-based extraction failed: {}", e))?
+    .ok_or_else(|| {
+        "No partitions found in OCI annotations. No recognized annotation schema detected."
+            .to_string()
+    })?;
 
     if partition_files.is_empty() {
-        return Err("No partitions found in OCI annotations. Expected layers with 'automotive.sdv.cloud.redhat.com/partition' annotations".into());
+        return Err(
+            "No partitions found in OCI annotations. No recognized annotation schema detected."
+                .into(),
+        );
     }
 
     println!(
