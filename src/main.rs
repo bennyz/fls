@@ -199,6 +199,7 @@ async fn main() {
                     file_pattern,
                     max_retries,
                     retry_delay_secs: retry_delay,
+                    annotation_schemas: vec![],
                 };
 
                 match fls::flash_from_oci(image_ref, options).await {

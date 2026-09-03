@@ -161,7 +161,7 @@ impl Manifest {
                 if let Some(layer) = m
                     .layers
                     .iter()
-                    .find(|l| l.media_type.starts_with("application/vnd.automotive.disk"))
+                    .find(|l| FlashableArtifact::is_flashable(&l.media_type))
                 {
                     return Ok(layer);
                 }
@@ -219,6 +219,11 @@ impl Descriptor {
         self.media_type == media_types::OCI_LAYER_ZSTD
     }
 
+    #[allow(dead_code)]
+    pub fn flashable_artifact(&self) -> Option<FlashableArtifact> {
+        FlashableArtifact::from_media_type(&self.media_type)
+    }
+
     /// Get compression type
     pub fn compression(&self) -> LayerCompression {
         if self.is_gzip_layer() {
@@ -237,6 +242,55 @@ pub enum LayerCompression {
     None,
     Gzip,
     Zstd,
+}
+
+/// Flashable disk image artifact types
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlashableArtifact {
+    DiskRaw,
+    DiskQcow2,
+    DiskSimg,
+}
+
+impl FlashableArtifact {
+    const MEDIA_TYPE_PREFIXES: &[&str] = &[
+        "application/vnd.automotive.disk",
+        "application/vnd.embedded.disk",
+    ];
+
+    pub fn from_media_type(media_type: &str) -> Option<Self> {
+        let suffix = Self::MEDIA_TYPE_PREFIXES
+            .iter()
+            .find_map(|prefix| media_type.strip_prefix(prefix))?;
+        match suffix {
+            ".raw" => Some(Self::DiskRaw),
+            ".qcow2" => Some(Self::DiskQcow2),
+            ".simg" => Some(Self::DiskSimg),
+            _ => None,
+        }
+    }
+
+    pub fn format_suffix(&self) -> &'static str {
+        match self {
+            Self::DiskRaw => ".raw",
+            Self::DiskQcow2 => ".qcow2",
+            Self::DiskSimg => ".simg",
+        }
+    }
+
+    pub fn is_flashable(media_type: &str) -> bool {
+        Self::from_media_type(media_type).is_some()
+    }
+
+    pub fn supported_types() -> Vec<String> {
+        let mut types = Vec::new();
+        for prefix in Self::MEDIA_TYPE_PREFIXES {
+            for artifact in [Self::DiskRaw, Self::DiskQcow2, Self::DiskSimg] {
+                types.push(format!("{}{}", prefix, artifact.format_suffix()));
+            }
+        }
+        types
+    }
 }
 
 impl From<LayerCompression> for crate::fls::compression::Compression {
@@ -446,6 +500,66 @@ mod tests {
                 assert_eq!(linux.digest, "sha256:manifest123");
             }
             _ => panic!("Expected manifest index"),
+        }
+    }
+
+    #[test]
+    fn test_flashable_artifact_from_media_type() {
+        // Automotive prefix
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.automotive.disk.raw"),
+            Some(FlashableArtifact::DiskRaw)
+        );
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.automotive.disk.qcow2"),
+            Some(FlashableArtifact::DiskQcow2)
+        );
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.automotive.disk.simg"),
+            Some(FlashableArtifact::DiskSimg)
+        );
+
+        // Embedded prefix — same formats, different domain
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.embedded.disk.raw"),
+            Some(FlashableArtifact::DiskRaw)
+        );
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.embedded.disk.qcow2"),
+            Some(FlashableArtifact::DiskQcow2)
+        );
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.embedded.disk.simg"),
+            Some(FlashableArtifact::DiskSimg)
+        );
+
+        // Unrecognized types
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.oci.image.layer.v1.tar+gzip"),
+            None
+        );
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.automotive.disk.vhdx"),
+            None
+        );
+        assert_eq!(
+            FlashableArtifact::from_media_type("application/vnd.unknown.disk.raw"),
+            None
+        );
+
+        // Round-trip: each format suffix resolves back from both prefixes
+        for artifact in [
+            FlashableArtifact::DiskRaw,
+            FlashableArtifact::DiskQcow2,
+            FlashableArtifact::DiskSimg,
+        ] {
+            for prefix in FlashableArtifact::MEDIA_TYPE_PREFIXES {
+                let media_type = format!("{}{}", prefix, artifact.format_suffix());
+                assert_eq!(
+                    FlashableArtifact::from_media_type(&media_type),
+                    Some(artifact)
+                );
+            }
         }
     }
 }

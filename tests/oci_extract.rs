@@ -142,6 +142,7 @@ fn default_options(cert_dir: &Path) -> OciOptions {
         file_pattern: None,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_secs: DEFAULT_RETRY_DELAY_SECS,
+        annotation_schemas: vec![],
     }
 }
 
@@ -611,6 +612,7 @@ async fn test_blob_truncation_triggers_retry_and_succeeds() {
         file_pattern: None,
         max_retries: 5,
         retry_delay_secs: 0, // No delay for fast testing
+        annotation_schemas: vec![],
     };
 
     let out_dir = tempdir().expect("create temp dir");

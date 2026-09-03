@@ -1,4 +1,5 @@
 // Module declarations
+pub mod annotation_schema;
 pub mod automotive;
 mod block_writer;
 pub mod byte_channel;

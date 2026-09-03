@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use super::annotation_schema::AnnotationSchema;
+
 pub const DEFAULT_MAX_RETRIES: usize = 10;
 pub const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
@@ -68,6 +70,8 @@ pub struct OciOptions {
     pub file_pattern: Option<String>,
     pub max_retries: usize,
     pub retry_delay_secs: u64,
+    /// Annotation schemas to try when resolving partitions. Empty = auto-detect.
+    pub annotation_schemas: Vec<AnnotationSchema>,
 }
 
 /// Options for fastboot flash operations
