@@ -168,6 +168,7 @@ fls from-url [OPTIONS] <URL> <DEVICE>
 - `--retry-delay <SECONDS>` - Delay in seconds between retry attempts (default: 2)
 - `--debug` - Enable debug output
 - `--o-direct` - Enable O_DIRECT mode for direct I/O (bypasses OS cache)
+- `--connections <N>` - Parallel HTTP connections for the download (default: 4). Falls back to a single stream when the server does not support Range requests
 - `-H, --header <HEADER>` - Custom HTTP headers (can be used multiple times, format: `Header: value`)
 - `-i, --progress-interval <SECONDS>` - Progress update interval in seconds (default: 0.5, accepts float values)
 - `-n, --newline-progress` - Print progress on new lines instead of overwriting

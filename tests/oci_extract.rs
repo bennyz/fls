@@ -89,10 +89,24 @@ async fn spawn_oci_server(
                                 .body(Full::new(Bytes::copy_from_slice(&manifest_body)))
                                 .unwrap()
                         } else if path == blob_path.as_str() {
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .body(Full::new(Bytes::copy_from_slice(&blob_body)))
-                                .unwrap()
+                            let range = req.headers().get("range").and_then(|h| h.to_str().ok());
+                            match parse_byte_range(range, blob_body.len()) {
+                                Some((start, end)) => Response::builder()
+                                    .status(StatusCode::PARTIAL_CONTENT)
+                                    .header("Content-Length", (end - start + 1).to_string())
+                                    .header(
+                                        "Content-Range",
+                                        format!("bytes {}-{}/{}", start, end, blob_body.len()),
+                                    )
+                                    .body(Full::new(Bytes::copy_from_slice(
+                                        &blob_body[start..=end],
+                                    )))
+                                    .unwrap(),
+                                None => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::copy_from_slice(&blob_body)))
+                                    .unwrap(),
+                            }
                         } else {
                             Response::builder()
                                 .status(StatusCode::NOT_FOUND)
@@ -109,6 +123,19 @@ async fn spawn_oci_server(
     });
 
     (local_addr, handle)
+}
+
+/// Parse "bytes=a-b" / "bytes=a-" into an inclusive range clamped to `len`.
+fn parse_byte_range(header: Option<&str>, len: usize) -> Option<(usize, usize)> {
+    let spec = header?.strip_prefix("bytes=")?;
+    let (start, end) = spec.split_once('-')?;
+    let start: usize = start.parse().ok()?;
+    let end: usize = if end.is_empty() {
+        len - 1
+    } else {
+        end.parse::<usize>().ok()?.min(len - 1)
+    };
+    (start <= end).then_some((start, end))
 }
 
 fn build_tar(entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
@@ -814,5 +841,17 @@ async fn test_flash_from_oci_tar_layer_with_raw_image() {
     let blob_bytes = build_ustar_tar(vec![("disk.img", raw.clone())]);
 
     let written = flash_blob_to_file("application/vnd.automotive.disk.raw", blob_bytes).await;
+    assert!(written == raw, "flashed image differs from expected");
+}
+
+/// Raw (non-tar, uncompressed) layer larger than one download segment: the blob
+/// is fetched with parallel range requests and must be reassembled in order.
+#[tokio::test]
+async fn test_flash_from_oci_raw_layer_parallel_download() {
+    let mut raw = b"RAWDISK-".to_vec();
+    raw.extend((8..40 * 1024 * 1024).map(|i| ((i as u64).wrapping_mul(2654435761) >> 13) as u8));
+
+    let written = flash_blob_to_file("application/vnd.automotive.disk.raw", raw.clone()).await;
+    assert_eq!(written.len(), raw.len());
     assert!(written == raw, "flashed image differs from expected");
 }

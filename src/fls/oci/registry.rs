@@ -4,6 +4,8 @@
 /// - GET /v2/ - API version check
 /// - GET /v2/<name>/manifests/<reference> - Fetch manifest
 /// - GET /v2/<name>/blobs/<digest> - Fetch blob
+use std::sync::Arc;
+
 use reqwest::{Client, Response, StatusCode};
 
 use super::auth::{request_token, Credentials, WwwAuthenticate};
@@ -11,6 +13,10 @@ use super::manifest::{media_types, Manifest};
 use super::reference::ImageReference;
 use crate::fls::download_error::DownloadError;
 use crate::fls::options::{HttpClientOptions, OciOptions};
+use crate::fls::parallel_download::{
+    parallel_stream, partial_content_range, response_stream, ByteStream, ParallelConfig,
+    RangeFetcher, SEGMENT_SIZE,
+};
 
 /// OCI Registry client
 pub struct RegistryClient {
@@ -97,15 +103,29 @@ impl RegistryClient {
         }
     }
 
+    /// Authorization header value for registry requests, if any
+    fn auth_header_value(&self) -> Option<String> {
+        match &self.token {
+            Some(token) => Some(format!("Bearer {}", token)),
+            None => self.credentials.basic_auth_header(),
+        }
+    }
+
     /// Add authorization header to request if we have a token
     fn add_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(token) = &self.token {
-            request.header("Authorization", format!("Bearer {}", token))
-        } else if let Some(basic) = self.credentials.basic_auth_header() {
-            request.header("Authorization", basic)
-        } else {
-            request
+        match self.auth_header_value() {
+            Some(value) => request.header("Authorization", value),
+            None => request,
         }
+    }
+
+    fn blob_url(&self, digest: &str) -> String {
+        format!(
+            "{}/v2/{}/blobs/{}",
+            self.image_ref.registry_url(),
+            self.image_ref.api_repository(),
+            digest
+        )
     }
 
     /// Fetch the image manifest
@@ -219,27 +239,36 @@ impl RegistryClient {
         digest: &str,
         resume_from: Option<u64>,
     ) -> Result<Response, Box<dyn std::error::Error>> {
-        let url = format!(
-            "{}/v2/{}/blobs/{}",
-            self.image_ref.registry_url(),
-            self.image_ref.api_repository(),
-            digest
-        );
+        self.get_blob_range(digest, resume_from.unwrap_or(0), None)
+            .await
+    }
+
+    /// Fetch `start..=end` of a blob (`end` None = to the end). No Range header
+    /// is sent for the whole blob.
+    async fn get_blob_range(
+        &self,
+        digest: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Response, Box<dyn std::error::Error>> {
+        let url = self.blob_url(digest);
 
         if self.debug {
-            if let Some(offset) = resume_from {
-                eprintln!(
+            match (start, end) {
+                (0, None) => eprintln!("[DEBUG] Starting blob download: {}", url),
+                (offset, None) => eprintln!(
                     "[DEBUG] Resuming blob download from byte {}: {}",
                     offset, url
-                );
-            } else {
-                eprintln!("[DEBUG] Starting blob download: {}", url);
+                ),
+                (s, Some(e)) => eprintln!("[DEBUG] Fetching blob bytes {}-{}: {}", s, e, url),
             }
         }
 
         let mut request = self.client.get(&url);
-        if let Some(offset) = resume_from {
-            request = request.header("Range", format!("bytes={}-", offset));
+        match (start, end) {
+            (0, None) => {}
+            (s, Some(e)) => request = request.header("Range", format!("bytes={}-{}", s, e)),
+            (s, None) => request = request.header("Range", format!("bytes={}-", s)),
         }
         let response = self.add_auth(request).send().await?;
 
@@ -254,6 +283,78 @@ impl RegistryClient {
         }
 
         Ok(response)
+    }
+
+    /// Fetcher for `start..=end` byte ranges of a blob, for parallel download.
+    fn blob_range_fetcher(&self, digest: &str) -> RangeFetcher {
+        let client = self.client.clone();
+        let url = self.blob_url(digest);
+        let auth = self.auth_header_value();
+        Arc::new(move |start, end| {
+            let mut request = client
+                .get(&url)
+                .header("Range", format!("bytes={}-{}", start, end));
+            if let Some(value) = &auth {
+                request = request.header("Authorization", value.clone());
+            }
+            Box::pin(async move {
+                let response = request.send().await.map_err(DownloadError::from_reqwest)?;
+                if !response.status().is_success()
+                    && response.status() != StatusCode::PARTIAL_CONTENT
+                {
+                    return Err(DownloadError::from_http_status(response.status()));
+                }
+                Ok(response)
+            })
+        })
+    }
+
+    /// Open a blob download, returning its byte stream and total size if known.
+    ///
+    /// With `parallel` set, the first segment is requested with a Range header;
+    /// if the registry honours it, the rest is fetched over several connections.
+    /// Registries that ignore Range get a single stream.
+    pub async fn open_blob_download(
+        &self,
+        digest: &str,
+        parallel: Option<&ParallelConfig>,
+    ) -> Result<(ByteStream, Option<u64>), Box<dyn std::error::Error>> {
+        let Some(config) = parallel else {
+            let response = self.get_blob_stream(digest).await?;
+            let len = response.content_length();
+            return Ok((response_stream(response), len));
+        };
+
+        let response = self
+            .get_blob_range(digest, 0, Some(SEGMENT_SIZE - 1))
+            .await?;
+        match partial_content_range(&response) {
+            Some((start, _, _)) if start != 0 => Err(format!(
+                "Registry returned range starting at byte {} instead of 0",
+                start
+            )
+            .into()),
+            Some((_, end, Some(total))) if end + 1 < total => {
+                println!(
+                    "Downloading with {} parallel connections ({} MB segments)",
+                    config.connections,
+                    SEGMENT_SIZE / (1024 * 1024)
+                );
+                let fetch = self.blob_range_fetcher(digest);
+                Ok((
+                    parallel_stream(response, 0, end, total, fetch, config.clone()),
+                    Some(total),
+                ))
+            }
+            Some((_, end, _)) => Ok((response_stream(response), Some(end + 1))),
+            None => {
+                if self.debug {
+                    eprintln!("[DEBUG] Registry ignored Range request, using a single stream");
+                }
+                let len = response.content_length();
+                Ok((response_stream(response), len))
+            }
+        }
     }
 
     /// Get the image reference

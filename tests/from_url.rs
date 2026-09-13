@@ -1050,3 +1050,141 @@ async fn test_https_certificate_validation_fails() {
 
     println!("✓ Test passed: Certificate validation correctly rejected certificate without CA");
 }
+
+/// Parse "bytes=a-b" / "bytes=a-" into an inclusive range clamped to `len`.
+fn parse_byte_range(header: Option<&str>, len: usize) -> Option<(usize, usize)> {
+    let spec = header?.strip_prefix("bytes=")?;
+    let (start, end) = spec.split_once('-')?;
+    let start: usize = start.parse().ok()?;
+    let end: usize = if end.is_empty() {
+        len - 1
+    } else {
+        end.parse::<usize>().ok()?.min(len - 1)
+    };
+    (start <= end).then_some((start, end))
+}
+
+/// Server that honours closed byte ranges. The first attempt at the second
+/// 16 MiB segment is cut off after 1 MiB, so that segment has to resume from
+/// where it stopped while the other segments carry on.
+#[tokio::test]
+async fn test_parallel_range_download_reassembles_and_resumes() {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request as HyperRequest, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    const SEGMENT: usize = 16 * 1024 * 1024;
+    let total = 40 * 1024 * 1024;
+    let test_data: Arc<Vec<u8>> = Arc::new(
+        (0..total)
+            .map(|i| ((i as u64).wrapping_mul(2654435761) >> 13) as u8)
+            .collect(),
+    );
+    let requests = Arc::new(AtomicUsize::new(0));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let second_segment_attempts = Arc::new(AtomicUsize::new(0));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = {
+        let test_data = test_data.clone();
+        let requests = requests.clone();
+        let in_flight = in_flight.clone();
+        let max_in_flight = max_in_flight.clone();
+        let second_segment_attempts = second_segment_attempts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let test_data = test_data.clone();
+                let requests = requests.clone();
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                let second_segment_attempts = second_segment_attempts.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = service_fn(move |req: HyperRequest<hyper::body::Incoming>| {
+                        let test_data = test_data.clone();
+                        let requests = requests.clone();
+                        let in_flight = in_flight.clone();
+                        let max_in_flight = max_in_flight.clone();
+                        let second_segment_attempts = second_segment_attempts.clone();
+                        async move {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_in_flight.fetch_max(now, Ordering::SeqCst);
+                            // Hold the request open briefly so overlap is observable
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                            let range = req.headers().get("range").and_then(|h| h.to_str().ok());
+                            let response = match parse_byte_range(range, test_data.len()) {
+                                Some((start, end)) => {
+                                    let mut body = test_data[start..=end].to_vec();
+                                    if start == SEGMENT
+                                        && second_segment_attempts.fetch_add(1, Ordering::SeqCst)
+                                            == 0
+                                    {
+                                        body.truncate(1024 * 1024);
+                                    }
+                                    Response::builder()
+                                        .status(StatusCode::PARTIAL_CONTENT)
+                                        .header("Content-Length", (end - start + 1).to_string())
+                                        .header(
+                                            "Content-Range",
+                                            format!("bytes {}-{}/{}", start, end, test_data.len()),
+                                        )
+                                        .header("Accept-Ranges", "bytes")
+                                        .body(Full::new(Bytes::from(body)))
+                                        .unwrap()
+                                }
+                                None => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Content-Length", test_data.len().to_string())
+                                    .body(Full::new(Bytes::copy_from_slice(&test_data)))
+                                    .unwrap(),
+                            };
+                            Ok::<_, Infallible>(response)
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                });
+            }
+        })
+    };
+
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    let mut options = test_options(temp_file.path().to_string_lossy().to_string());
+    options.retry_delay_secs = 0;
+    options.common.connections = 4;
+
+    let url = format!("http://{}/disk.img", addr);
+    let result = flash_from_url(&url, options).await;
+    server_handle.abort();
+    assert!(result.is_ok(), "Flash operation failed: {:?}", result.err());
+
+    let written = std::fs::read(temp_file.path()).expect("Failed to read written file");
+    assert_eq!(written.len(), test_data.len());
+    assert!(written == *test_data, "Written data does not match source");
+
+    assert!(
+        max_in_flight.load(Ordering::SeqCst) >= 2,
+        "expected overlapping range requests, max in flight was {}",
+        max_in_flight.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        second_segment_attempts.load(Ordering::SeqCst),
+        2,
+        "second segment should have been retried exactly once"
+    );
+    assert!(requests.load(Ordering::SeqCst) >= 4);
+}

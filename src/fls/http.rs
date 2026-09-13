@@ -1,6 +1,11 @@
 use crate::fls::download_error::DownloadError;
 use crate::fls::options::HttpClientOptions;
-use reqwest::Client;
+use crate::fls::parallel_download::{
+    parallel_stream, partial_content_range, response_stream, ByteStream, ParallelConfig,
+    RangeFetcher, SEGMENT_SIZE,
+};
+use reqwest::{Client, StatusCode};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) async fn setup_http_client(
@@ -67,6 +72,13 @@ pub(crate) async fn setup_http_client(
         builder = builder.danger_accept_invalid_certs(true);
     }
 
+    if options.http1_only {
+        if options.debug {
+            eprintln!("[DEBUG]   HTTP/1.1 only: parallel requests use separate connections");
+        }
+        builder = builder.http1_only();
+    }
+
     if options.debug {
         eprintln!("[DEBUG] HTTP Client initialized successfully\n");
     }
@@ -74,34 +86,141 @@ pub(crate) async fn setup_http_client(
     Ok(builder.build()?)
 }
 
-pub(crate) async fn start_download(
-    url: &str,
-    client: &Client,
-    resume_from: Option<u64>,
-    custom_headers: &[(String, String)],
-    debug: bool,
-) -> Result<reqwest::Response, DownloadError> {
-    if let Some(offset) = resume_from {
-        println!("Resuming download from: {} (byte offset: {})", url, offset);
-    } else {
-        println!("Starting download from: {}", url);
-    }
+/// Inclusive byte range to request: `(start, Some(end))` or open-ended `(start, None)`.
+type ByteRange = (u64, Option<u64>);
 
+fn build_request(
+    client: &Client,
+    url: &str,
+    custom_headers: &[(String, String)],
+    range: Option<ByteRange>,
+) -> reqwest::RequestBuilder {
     let mut request = client
         .get(url)
         .header("User-Agent", "fls/0.1.0")
         .header("Accept", "*/*")
         .header("Accept-Encoding", "identity"); // Don't compress, we're handling .xz ourselves
 
-    // Add custom headers
     for (name, value) in custom_headers {
         request = request.header(name, value);
     }
 
-    // Add Range header if resuming
-    if let Some(offset) = resume_from {
-        request = request.header("Range", format!("bytes={}-", offset));
+    if let Some((start, end)) = range {
+        let value = match end {
+            Some(end) => format!("bytes={}-{}", start, end),
+            None => format!("bytes={}-", start),
+        };
+        request = request.header("Range", value);
     }
+
+    request
+}
+
+fn range_fetcher(url: &str, client: &Client, custom_headers: &[(String, String)]) -> RangeFetcher {
+    let url = url.to_string();
+    let client = client.clone();
+    let headers = custom_headers.to_vec();
+    Arc::new(move |start, end| {
+        let request = build_request(&client, &url, &headers, Some((start, Some(end))));
+        Box::pin(async move {
+            let response = request.send().await.map_err(DownloadError::from_reqwest)?;
+            if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
+                return Err(DownloadError::from_http_response(&response));
+            }
+            Ok(response)
+        })
+    })
+}
+
+/// An opened download: the body stream, the number of bytes it will deliver
+/// (when known), and whether the server honoured our Range request.
+pub(crate) struct OpenedDownload {
+    pub stream: ByteStream,
+    pub remaining: Option<u64>,
+    pub ranged: bool,
+}
+
+/// Open a download from `resume_from` (or the start), fetching with parallel
+/// range requests when `parallel` is given and the server honours Range.
+pub(crate) async fn open_download(
+    url: &str,
+    client: &Client,
+    resume_from: Option<u64>,
+    custom_headers: &[(String, String)],
+    parallel: Option<&ParallelConfig>,
+    debug: bool,
+) -> Result<OpenedDownload, DownloadError> {
+    let start = resume_from.unwrap_or(0);
+    let range = match (parallel, resume_from) {
+        (Some(_), _) => Some((start, Some(start + SEGMENT_SIZE - 1))),
+        (None, Some(offset)) => Some((offset, None)),
+        (None, None) => None,
+    };
+
+    let response = start_download(url, client, range, custom_headers, debug).await?;
+
+    if let Some(config) = parallel {
+        match partial_content_range(&response) {
+            Some((s, _, _)) if s != start => {
+                return Err(DownloadError::Other(format!(
+                    "Server returned range starting at byte {} instead of {}",
+                    s, start
+                )));
+            }
+            Some((_, end, Some(total))) if end + 1 < total => {
+                println!(
+                    "Downloading with {} parallel connections ({} MB segments)",
+                    config.connections,
+                    SEGMENT_SIZE / (1024 * 1024)
+                );
+                let fetch = range_fetcher(url, client, custom_headers);
+                return Ok(OpenedDownload {
+                    stream: parallel_stream(response, start, end, total, fetch, config.clone()),
+                    remaining: Some(total - start),
+                    ranged: true,
+                });
+            }
+            Some((_, end, _)) => {
+                return Ok(OpenedDownload {
+                    stream: response_stream(response),
+                    remaining: Some(end + 1 - start),
+                    ranged: true,
+                });
+            }
+            None => {}
+        }
+    }
+
+    let ranged = response.status() == StatusCode::PARTIAL_CONTENT;
+    if range.is_some() && !ranged && debug {
+        eprintln!("[DEBUG] Server ignored Range request, using a single stream");
+    }
+    if resume_from.is_some() && !ranged {
+        println!("Warning: Server does not support range requests, starting from beginning");
+    }
+    let remaining = response.content_length();
+    Ok(OpenedDownload {
+        stream: response_stream(response),
+        remaining,
+        ranged,
+    })
+}
+
+async fn start_download(
+    url: &str,
+    client: &Client,
+    range: Option<ByteRange>,
+    custom_headers: &[(String, String)],
+    debug: bool,
+) -> Result<reqwest::Response, DownloadError> {
+    match range {
+        Some((offset, _)) if offset > 0 => {
+            println!("Resuming download from: {} (byte offset: {})", url, offset)
+        }
+        _ => println!("Starting download from: {}", url),
+    }
+
+    let request = build_request(client, url, custom_headers, range);
 
     // Debug: Log request details
     if debug {
@@ -115,8 +234,11 @@ pub(crate) async fn start_download(
         for (name, value) in custom_headers {
             eprintln!("[DEBUG]     {}: {}", name, value);
         }
-        if let Some(offset) = resume_from {
-            eprintln!("[DEBUG]     Range: bytes={}-", offset);
+        if let Some((start, end)) = range {
+            match end {
+                Some(end) => eprintln!("[DEBUG]     Range: bytes={}-{}", start, end),
+                None => eprintln!("[DEBUG]     Range: bytes={}-", start),
+            }
         }
     }
 
@@ -146,22 +268,8 @@ pub(crate) async fn start_download(
     }
 
     // Accept both 200 (full content) and 206 (partial content) as success
-    if !response.status().is_success() && response.status().as_u16() != 206 {
+    if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
         return Err(DownloadError::from_http_response(&response));
-    }
-
-    // Check if server supports resume
-    if resume_from.is_some() && response.status().as_u16() != 206 {
-        println!("Warning: Server does not support range requests, starting from beginning");
-    }
-
-    let content_length = response.content_length();
-    if let Some(len) = content_length {
-        if resume_from.is_some() {
-            println!("Remaining content length: {} bytes", len);
-        } else {
-            println!("Content length: {} bytes", len);
-        }
     }
 
     Ok(response)

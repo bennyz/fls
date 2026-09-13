@@ -32,6 +32,7 @@ use crate::fls::error_handling::process_error_messages;
 use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
 use crate::fls::magic_bytes::{detect_compression, detect_content_and_compression, ContentType};
 use crate::fls::options::OciOptions;
+use crate::fls::parallel_download::{response_stream, ByteStream, ParallelConfig};
 use crate::fls::progress::ProgressTracker;
 use crate::fls::simg::{SparseParser, WriteCommand};
 use crate::fls::stream_utils::ChannelReader;
@@ -111,14 +112,7 @@ async fn fetch_blob_with_detection(
     client: &RegistryClient,
     digest: &str,
     options: &OciOptions,
-) -> Result<
-    (
-        std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>,
-        Vec<Bytes>,
-        Compression,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(ByteStream, Vec<Bytes>, Compression), Box<dyn std::error::Error>> {
     let max_retries = options.max_retries;
     let retry_delay_secs = options.retry_delay_secs;
     let mut retry_count: usize = 0;
@@ -155,7 +149,7 @@ async fn fetch_blob_with_detection(
             }
         };
 
-        let mut stream = response.bytes_stream();
+        let mut stream = response_stream(response);
         let mut prefix = Vec::new();
         let mut initial_chunks: Vec<Bytes> = Vec::new();
 
@@ -168,8 +162,7 @@ async fn fetch_blob_with_detection(
                     prefix.extend_from_slice(&chunk[..take]);
                     initial_chunks.push(chunk);
                 }
-                Some(Err(e)) => {
-                    let dl_err = DownloadError::from_reqwest(e);
+                Some(Err(dl_err)) => {
                     match handle_download_retry(
                         &dl_err,
                         &mut retry_count,
@@ -195,7 +188,7 @@ async fn fetch_blob_with_detection(
         }
 
         let compression = detect_compression(&prefix);
-        return Ok((Box::pin(stream), initial_chunks, compression));
+        return Ok((stream, initial_chunks, compression));
     }
 }
 
@@ -206,7 +199,7 @@ async fn fetch_blob_with_detection(
 async fn retry_download_loop(
     client: &RegistryClient,
     digest: &str,
-    mut stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    mut stream: ByteStream,
     initial_chunks: Vec<Bytes>,
     buffer_tx: &crate::fls::byte_channel::ByteBoundedSender<Bytes>,
     options: &OciOptions,
@@ -243,7 +236,7 @@ async fn retry_download_loop(
                     retry_count = 0;
                 }
                 Ok(Some(Err(e))) => {
-                    connection_error = Some(DownloadError::from_reqwest(e));
+                    connection_error = Some(e);
                     connection_broken = true;
                     break;
                 }
@@ -295,7 +288,7 @@ async fn retry_download_loop(
                     )
                     .into());
                 }
-                stream = Box::pin(response.bytes_stream());
+                stream = response_stream(response);
             }
             Err(e) => {
                 return Err(format!(
@@ -318,7 +311,7 @@ async fn retry_download_loop(
 async fn run_blob_pipeline<T: Send + 'static>(
     client: &RegistryClient,
     digest: &str,
-    stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    stream: ByteStream,
     initial_chunks: Vec<Bytes>,
     mut decompressor_stdin: tokio::process::ChildStdin,
     mut decompressor: tokio::process::Child,
@@ -1208,7 +1201,7 @@ async fn setup_tar_processing_pipeline(
 
 /// Coordinate the download process with progress tracking and cleanup
 async fn coordinate_download_and_processing(
-    mut stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
+    mut stream: ByteStream,
     context: DownloadContext,
     mut params: DownloadCoordinationParams,
     handles: ProcessingHandles,
@@ -1489,7 +1482,7 @@ async fn setup_inprocess_decompression_pipeline(
 
 /// Coordinate raw disk image download with progress tracking and cleanup
 async fn coordinate_raw_disk_download(
-    mut stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
+    mut stream: ByteStream,
     initial_buffer: Vec<u8>,
     layer_size: u64,
     mut params: RawDiskDownloadParams,
@@ -1669,8 +1662,18 @@ pub async fn flash_from_oci(
 
     // Start blob download
     println!("\nStarting download...");
-    let response = client.get_blob_stream(&layer.digest).await?;
-    let content_length = response.content_length();
+    let parallel = ParallelConfig {
+        connections: options.common.connections,
+        max_retries: options.max_retries,
+        retry_delay_secs: options.retry_delay_secs,
+        debug: options.common.debug,
+    };
+    let (mut stream, content_length) = client
+        .open_blob_download(
+            &layer.digest,
+            (parallel.connections > 1).then_some(&parallel),
+        )
+        .await?;
 
     // We'll detect actual compression from the data stream since
     // some registries don't set the media type correctly
@@ -1680,7 +1683,6 @@ pub async fn flash_from_oci(
     let mut content_detection_buffer = Vec::new();
     let detection_size = 2 * 1024 * 1024; // 2MB should be enough for detection
 
-    let mut stream = response.bytes_stream();
     while content_detection_buffer.len() < detection_size {
         match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
             Ok(Some(chunk_result)) => match chunk_result {
@@ -2256,7 +2258,7 @@ impl<R: Read> Read for DebugReader<R> {
 /// Flash raw disk image directly without tar extraction
 async fn flash_raw_disk_image_directly(
     initial_buffer: Vec<u8>,
-    stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + std::marker::Unpin,
+    stream: ByteStream,
     compression_type: Compression,
     options: OciOptions,
     layer_size: u64,

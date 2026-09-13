@@ -15,6 +15,7 @@ mod magic_bytes;
 mod memory;
 pub mod oci;
 mod options;
+mod parallel_download;
 mod progress;
 mod simg;
 mod stream_utils;

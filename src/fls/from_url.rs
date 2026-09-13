@@ -11,8 +11,9 @@ use crate::fls::decompress::{get_compression_from_url, start_inprocess_decompres
 use crate::fls::download_error::DownloadError;
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
-use crate::fls::http::{setup_http_client, start_download};
+use crate::fls::http::{open_download, setup_http_client};
 use crate::fls::options::{BlockFlashOptions, HttpClientOptions};
+use crate::fls::parallel_download::ParallelConfig;
 use crate::fls::progress::ProgressTracker;
 use crate::fls::simg::{SparseParser, WriteCommand};
 
@@ -307,6 +308,15 @@ pub async fn flash_from_url(
     let mut retry_count = 0;
     let debug = options.common.debug;
 
+    let parallel = ParallelConfig {
+        connections: options.common.connections,
+        max_retries: options.max_retries,
+        retry_delay_secs: options.retry_delay_secs,
+        debug,
+    };
+    // Cleared once the server answers a Range probe with a full response
+    let mut parallel_ok = parallel.connections > 1;
+
     loop {
         if writer_handle.is_finished() {
             eprintln!();
@@ -323,38 +333,52 @@ pub async fn flash_from_url(
         };
 
         // Start or resume download
-        let response =
-            match start_download(url, &client, resume_from, &options.headers, debug).await {
-                Ok(r) => r,
-                Err(e) => {
-                    match handle_download_retry(
-                        &e,
-                        &mut retry_count,
-                        options.max_retries,
-                        options.retry_delay_secs,
-                    ) {
-                        Some(delay) => {
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        None => return Err(e.into()),
+        let opened = match open_download(
+            url,
+            &client,
+            resume_from,
+            &options.headers,
+            parallel_ok.then_some(&parallel),
+            debug,
+        )
+        .await
+        {
+            Ok(opened) => opened,
+            Err(e) => {
+                match handle_download_retry(
+                    &e,
+                    &mut retry_count,
+                    options.max_retries,
+                    options.retry_delay_secs,
+                ) {
+                    Some(delay) => {
+                        tokio::time::sleep(delay).await;
+                        continue;
                     }
+                    None => return Err(e.into()),
                 }
-            };
-
-        let content_length = if let Some(offset) = resume_from {
-            // For resumed downloads, we need to add the offset to partial content length
-            response.content_length().map(|len| len + offset)
-        } else {
-            response.content_length()
+            }
         };
+
+        if !opened.ranged {
+            parallel_ok = false;
+        }
+
+        // Bytes still to come plus what we already have gives the full length
+        let content_length = opened.remaining.map(|len| len + resume_from.unwrap_or(0));
+        if let Some(len) = opened.remaining {
+            match resume_from {
+                Some(_) => println!("Remaining content length: {} bytes", len),
+                None => println!("Content length: {} bytes", len),
+            }
+        }
 
         // Set content length in progress tracker (only on first attempt)
         if progress.content_length.is_none() {
             progress.set_content_length(content_length);
         }
 
-        let mut stream = response.bytes_stream();
+        let mut stream = opened.stream;
 
         // Download and buffer chunks for this connection
         let mut connection_broken = false;
@@ -424,7 +448,7 @@ pub async fn flash_from_url(
                             }
                         }
                         Err(e) => {
-                            connection_error = Some(DownloadError::from_reqwest(e));
+                            connection_error = Some(e);
                             connection_broken = true;
                             break;
                         }

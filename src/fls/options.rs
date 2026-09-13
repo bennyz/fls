@@ -7,6 +7,8 @@ pub const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
 pub const DEFAULT_XZ_MEMLIMIT_MB: u64 = 256;
 
+pub const DEFAULT_CONNECTIONS: usize = 4;
+
 /// Common options shared between URL and OCI flash operations
 #[derive(Debug, Clone)]
 pub struct FlashOptions {
@@ -21,6 +23,8 @@ pub struct FlashOptions {
     pub newline_progress: bool,
     pub show_memory: bool,
     pub xz_memlimit_mb: u64,
+    /// Parallel connections for ranged downloads (1 = single stream)
+    pub connections: usize,
 }
 
 impl Default for FlashOptions {
@@ -37,6 +41,7 @@ impl Default for FlashOptions {
             newline_progress: false,
             show_memory: false,
             xz_memlimit_mb: DEFAULT_XZ_MEMLIMIT_MB,
+            connections: DEFAULT_CONNECTIONS,
         }
     }
 }
@@ -104,6 +109,8 @@ pub struct HttpClientOptions {
     pub insecure_tls: bool,
     pub cacert: Option<PathBuf>,
     pub debug: bool,
+    /// Force HTTP/1.1 so concurrent requests get separate TCP connections
+    pub http1_only: bool,
 }
 
 impl From<&FlashOptions> for HttpClientOptions {
@@ -112,6 +119,7 @@ impl From<&FlashOptions> for HttpClientOptions {
             insecure_tls: opts.insecure_tls,
             cacert: opts.cacert.clone(),
             debug: opts.debug,
+            http1_only: opts.connections > 1,
         }
     }
 }

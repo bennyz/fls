@@ -75,6 +75,10 @@ enum Commands {
         /// XZ decompression memory limit in MB (exceeds = single-thread fallback, then error)
         #[arg(long, default_value = "256")]
         xz_memlimit: u64,
+        /// Parallel HTTP connections for the download; falls back to a single
+        /// stream when the server does not support Range requests (default: 4)
+        #[arg(long, default_value = "4")]
+        connections: usize,
         /// Registry username for OCI authentication
         #[arg(short = 'u', long, env = "FLS_REGISTRY_USERNAME")]
         username: Option<String>,
@@ -140,6 +144,7 @@ async fn main() {
             password,
             file_pattern,
             xz_memlimit,
+            connections,
         } => {
             // Detect URL scheme to determine handler
             let is_oci = url.starts_with("oci://");
@@ -178,6 +183,7 @@ async fn main() {
                 println!("  Write buffer size: {} MB", write_buffer_size);
                 println!("  Debug: {}", debug);
                 println!("  O_DIRECT mode: {}", o_direct);
+                println!("  Connections: {}", connections);
                 println!();
 
                 let options = fls::OciOptions {
@@ -193,6 +199,7 @@ async fn main() {
                         newline_progress,
                         show_memory,
                         xz_memlimit_mb: xz_memlimit,
+                        connections,
                     },
                     username,
                     password,
@@ -228,6 +235,7 @@ async fn main() {
                 println!("  Retry delay: {} seconds", retry_delay);
                 println!("  Debug: {}", debug);
                 println!("  O_DIRECT mode: {}", o_direct);
+                println!("  Connections: {}", connections);
 
                 // Parse headers in the format "Header: value"
                 let parsed_headers: Vec<(String, String)> = headers
@@ -272,6 +280,7 @@ async fn main() {
                         newline_progress,
                         show_memory,
                         xz_memlimit_mb: xz_memlimit,
+                        connections,
                     },
                     max_retries,
                     retry_delay_secs: retry_delay,
@@ -346,6 +355,7 @@ async fn main() {
                     insecure_tls,
                     cacert,
                     debug,
+                    http1_only: false,
                 },
                 device_serial: serial,
                 partition_mappings: targets,
