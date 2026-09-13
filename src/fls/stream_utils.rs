@@ -3,8 +3,13 @@ use bytes::Bytes;
 use std::io::Read;
 use tokio::sync::mpsc;
 
+enum Source {
+    ByteBounded(ByteBoundedReceiver<Bytes>),
+    Vec(mpsc::Receiver<Vec<u8>>),
+}
+
 pub struct ChannelReader {
-    rx: ByteBoundedReceiver<Bytes>,
+    rx: Source,
     current: Option<Bytes>,
     offset: usize,
     progress_tx: Option<mpsc::UnboundedSender<u64>>,
@@ -12,11 +17,26 @@ pub struct ChannelReader {
 
 impl ChannelReader {
     pub fn new_byte_bounded(rx: ByteBoundedReceiver<Bytes>) -> Self {
+        Self::from_source(Source::ByteBounded(rx))
+    }
+
+    pub fn new_vec(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self::from_source(Source::Vec(rx))
+    }
+
+    fn from_source(rx: Source) -> Self {
         Self {
             rx,
             current: None,
             offset: 0,
             progress_tx: None,
+        }
+    }
+
+    fn recv(&mut self) -> Option<Bytes> {
+        match &mut self.rx {
+            Source::ByteBounded(rx) => rx.blocking_recv(),
+            Source::Vec(rx) => rx.blocking_recv().map(Bytes::from),
         }
     }
 
@@ -39,7 +59,7 @@ impl Read for ChannelReader {
                 }
             }
 
-            match self.rx.blocking_recv() {
+            match self.recv() {
                 Some(data) => {
                     if let Some(ref tx) = self.progress_tx {
                         let _ = tx.send(data.len() as u64);

@@ -1,7 +1,7 @@
 /// Flash from OCI image
 ///
 /// Implements the streaming pipeline:
-/// Registry blob -> gzip decompress -> tar extract -> xzcat -> block device
+/// Registry blob -> gzip decompress -> tar extract -> in-process xz/gzip decompress -> block device
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::fls::byte_channel::{byte_bounded_channel, ByteBoundedReceiver, ByteBoundedSender};
-use crate::fls::decompress::start_decompressor_for_compression;
+use crate::fls::decompress::{
+    start_decompressor_for_compression, start_inprocess_decompressor_autodetect,
+};
 use crate::fls::download_error::{handle_download_retry, DownloadError};
 
 use super::manifest::{FlashableArtifact, LayerCompression, Manifest};
@@ -26,7 +28,6 @@ use crate::fls::annotation_schema::{
 };
 use crate::fls::block_writer::AsyncBlockWriter;
 use crate::fls::compression::Compression;
-use crate::fls::decompress::{spawn_stderr_reader, start_decompressor_process};
 use crate::fls::error_handling::process_error_messages;
 use crate::fls::format_detector::{DetectionResult, FileFormat, FormatDetector};
 use crate::fls::magic_bytes::{detect_compression, detect_content_and_compression, ContentType};
@@ -51,7 +52,7 @@ struct DownloadCoordinationParams {
 struct DownloadContext {
     content_detection_buffer: Vec<u8>,
     content_length: Option<u64>,
-    decompressor_name: &'static str,
+    is_compressed: bool,
 }
 
 /// Parameters for raw disk download coordination
@@ -66,7 +67,7 @@ struct RawDiskDownloadParams {
 /// Processing handles for coordination functions
 struct ProcessingHandles {
     writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
-    decompressor_writer_handle: tokio::task::JoinHandle<Result<(), String>>,
+    decompressor_handle: std::thread::JoinHandle<Result<(), String>>,
     error_processor: tokio::task::JoinHandle<()>,
     tar_extractor_handle: tokio::task::JoinHandle<Result<(), String>>,
 }
@@ -80,10 +81,8 @@ struct TarPipelineComponents {
     written_progress_rx: mpsc::UnboundedReceiver<u64>,
     decompressor_written_progress_rx: mpsc::UnboundedReceiver<u64>,
     writer_handle: tokio::task::JoinHandle<Result<u64, std::io::Error>>,
-    decompressor_writer_handle: tokio::task::JoinHandle<Result<(), String>>,
+    decompressor_handle: std::thread::JoinHandle<Result<(), String>>,
     error_processor: tokio::task::JoinHandle<()>,
-    decompressor: tokio::process::Child,
-    decompressor_name: &'static str,
 }
 
 /// Connect to an OCI registry and resolve the image manifest.
@@ -1105,11 +1104,12 @@ async fn resolve_manifest(
     Ok(manifest)
 }
 
-/// Setup the tar processing pipeline with channels, decompressor, and async tasks
+/// Setup the tar processing pipeline: channels, in-process decompressor, and writer task.
+///
+/// Files extracted from the tar stream are fed to a decoder thread that detects
+/// gzip/xz from the file's magic bytes, so no external `xzcat`/`zcat`/`cat`
+/// binaries are needed.
 async fn setup_tar_processing_pipeline(
-    content_type: ContentType,
-    compression: LayerCompression,
-    compression_type: Compression,
     options: &OciOptions,
     buffer_size_mb: usize,
     buffer_capacity: usize,
@@ -1123,36 +1123,20 @@ async fn setup_tar_processing_pipeline(
     let (http_tx, http_rx) =
         byte_bounded_channel::<bytes::Bytes>(max_buffer_bytes, buffer_capacity);
 
-    // Channel for tar entry data -> decompressor stdin
-    let (tar_tx, mut tar_rx) = mpsc::channel::<Vec<u8>>(16); // 16 * 8MB = 128MB buffer
+    // Channel for tar entry data -> decompressor
+    let (tar_tx, tar_rx) = mpsc::channel::<Vec<u8>>(16); // 16 * 8MB = 128MB buffer
 
     // Channels for progress tracking
     let (decompressed_progress_tx, decompressed_progress_rx) = mpsc::unbounded_channel::<u64>();
     let (error_tx, error_rx) = mpsc::unbounded_channel::<String>();
     let (written_progress_tx, written_progress_rx) = mpsc::unbounded_channel::<u64>();
-    // Channel for tracking bytes actually written to decompressor (for progress bar)
+    // Channel for tracking bytes consumed by the decompressor (for progress bar)
     let (decompressor_written_progress_tx, decompressor_written_progress_rx) =
         mpsc::unbounded_channel::<u64>();
 
-    // Choose decompressor based on content type and compression detection
-    let initial_decompressor_hint = get_decompressor_hint(
-        content_type.clone(),
-        compression,
-        compression_type,
-        options.file_pattern.as_deref(),
-    );
-    if options.common.debug {
-        eprintln!(
-            "[DEBUG] Selected decompressor hint: '{}' (content={:?}, layer_compression={:?}, content_compression={:?})",
-            initial_decompressor_hint, content_type, compression, compression_type
-        );
-    }
-    let (mut decompressor, decompressor_name) =
-        start_decompressor_process(initial_decompressor_hint).await?;
-
-    let mut decompressor_stdin = decompressor.stdin.take().unwrap();
-    let decompressor_stdout = decompressor.stdout.take().unwrap();
-    let decompressor_stderr = decompressor.stderr.take().unwrap();
+    let reader = ChannelReader::new_vec(tar_rx).with_progress(decompressor_written_progress_tx);
+    let (mut decompressed_rx, decompressor_handle) =
+        start_inprocess_decompressor_autodetect(reader, options.common.xz_memlimit_mb)?;
 
     println!(
         "Opening block device for writing: {}",
@@ -1168,41 +1152,25 @@ async fn setup_tar_processing_pipeline(
         options.common.write_buffer_size_mb,
     )?;
 
-    // Spawn task: decompressor stdout -> block writer with sparse image detection
+    // Spawn task: decompressed data -> block writer with sparse image detection
     let error_tx_clone = error_tx.clone();
     let debug = options.common.debug;
     let writer_handle = {
         let writer = block_writer;
         tokio::spawn(async move {
-            let mut stdout = decompressor_stdout;
-            let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
-
             // Auto-detect sparse image format from initial data
             let mut detector = FormatDetector::new();
             let mut parser: Option<SparseParser> = None;
             let mut format_determined = false;
 
-            loop {
-                let n = match tokio::io::AsyncReadExt::read(&mut stdout, &mut buffer).await {
-                    Ok(0) => {
-                        finalize_format_at_eof(&mut detector, format_determined, &writer, debug)
-                            .await?;
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(e) => {
-                        let _ =
-                            error_tx_clone.send(format!("Error reading from decompressor: {}", e));
-                        return Err(e);
-                    }
-                };
-
+            while let Some(data) = decompressed_rx.recv().await {
+                let n = data.len();
                 if decompressed_progress_tx.send(n as u64).is_err() {
                     break;
                 }
 
                 process_buffer_with_format_detection(
-                    &buffer,
+                    &data,
                     n,
                     &mut detector,
                     &mut parser,
@@ -1216,34 +1184,14 @@ async fn setup_tar_processing_pipeline(
                     e
                 })?;
             }
+
+            finalize_format_at_eof(&mut detector, format_determined, &writer, debug).await?;
             writer.close().await
         })
     };
 
-    // Spawn stderr reader for decompressor
-    tokio::spawn(spawn_stderr_reader(
-        decompressor_stderr,
-        error_tx.clone(),
-        decompressor_name,
-    ));
-
     // Spawn error processor
     let error_processor = tokio::spawn(process_error_messages(error_rx));
-
-    // Spawn task: tar channel -> decompressor stdin
-    let decompressor_writer_handle = tokio::spawn(async move {
-        while let Some(chunk) = tar_rx.recv().await {
-            let chunk_len = chunk.len() as u64;
-            if let Err(e) = decompressor_stdin.write_all(&chunk).await {
-                return Err(format!("Error writing to decompressor: {}", e));
-            }
-            // Notify that bytes were written to decompressor (for progress bar)
-            let _ = decompressor_written_progress_tx.send(chunk_len);
-        }
-        // Close stdin to signal EOF
-        drop(decompressor_stdin);
-        Ok::<(), String>(())
-    });
 
     Ok(TarPipelineComponents {
         http_tx,
@@ -1253,10 +1201,8 @@ async fn setup_tar_processing_pipeline(
         written_progress_rx,
         decompressor_written_progress_rx,
         writer_handle,
-        decompressor_writer_handle,
+        decompressor_handle,
         error_processor,
-        decompressor,
-        decompressor_name,
     })
 }
 
@@ -1266,7 +1212,6 @@ async fn coordinate_download_and_processing(
     context: DownloadContext,
     mut params: DownloadCoordinationParams,
     handles: ProcessingHandles,
-    mut decompressor: tokio::process::Child,
     options: &OciOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Get the buffer size before moving it
@@ -1286,7 +1231,7 @@ async fn coordinate_download_and_processing(
     let mut progress =
         ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
     progress.set_content_length(context.content_length);
-    progress.set_is_compressed(context.decompressor_name != "cat");
+    progress.set_is_compressed(context.is_compressed);
     progress.bytes_received = detection_buffer_size; // Account for detection buffer
     let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
     let debug = options.common.debug;
@@ -1376,12 +1321,7 @@ async fn coordinate_download_and_processing(
         return Err(format!("Tar extraction failed: {}", e).into());
     }
 
-    // Wait for decompressor writer
-    if let Err(e) = handles.decompressor_writer_handle.await? {
-        return Err(format!("Decompressor write failed: {}", e).into());
-    }
-
-    // Wait for decompressor process
+    // Wait for decompressor thread
     loop {
         while let Ok(byte_count) = params.decompressed_progress_rx.try_recv() {
             progress.bytes_decompressed += byte_count;
@@ -1391,23 +1331,24 @@ async fn coordinate_download_and_processing(
         }
         let _ = progress.update_progress(None, update_interval, false);
 
-        match decompressor.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(format!(
-                        "{} failed with status: {:?}",
-                        context.decompressor_name,
-                        status.code()
-                    )
-                    .into());
-                }
-                break;
-            }
-            Ok(None) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => return Err(e.into()),
+        if handles.decompressor_handle.is_finished() {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let decompressor_result = handles
+        .decompressor_handle
+        .join()
+        .map_err(|_| "Decompressor thread panicked".to_string())?;
+    if let Err(e) = decompressor_result {
+        // A writer failure shuts the decompressor down; report the root cause.
+        if handles.writer_handle.is_finished() {
+            if let Ok(Err(writer_err)) = handles.writer_handle.await {
+                return Err(Box::new(writer_err));
+            }
+        }
+        return Err(format!("Decompression failed: {}", e).into());
     }
 
     progress.decompress_duration = Some(progress.start_time.elapsed());
@@ -1814,15 +1755,7 @@ pub async fn flash_from_oci(
     }
 
     // Setup the complete tar processing pipeline
-    let pipeline = setup_tar_processing_pipeline(
-        content_type.clone(),
-        compression,
-        compression_type,
-        &options,
-        buffer_size_mb,
-        buffer_capacity,
-    )
-    .await?;
+    let pipeline = setup_tar_processing_pipeline(&options, buffer_size_mb, buffer_capacity).await?;
 
     // Extract components for use in the download loop
     let TarPipelineComponents {
@@ -1833,10 +1766,8 @@ pub async fn flash_from_oci(
         written_progress_rx,
         decompressor_written_progress_rx,
         writer_handle,
-        decompressor_writer_handle,
+        decompressor_handle,
         error_processor,
-        decompressor,
-        decompressor_name,
     } = pipeline;
 
     // Spawn blocking task: HTTP rx -> gzip -> tar -> tar tx
@@ -1859,7 +1790,7 @@ pub async fn flash_from_oci(
     let context = DownloadContext {
         content_detection_buffer,
         content_length,
-        decompressor_name,
+        is_compressed: compression_type != Compression::None,
     };
 
     let params = DownloadCoordinationParams {
@@ -1871,13 +1802,12 @@ pub async fn flash_from_oci(
 
     let handles = ProcessingHandles {
         writer_handle,
-        decompressor_writer_handle,
+        decompressor_handle,
         error_processor,
         tar_extractor_handle,
     };
 
-    coordinate_download_and_processing(stream, context, params, handles, decompressor, &options)
-        .await
+    coordinate_download_and_processing(stream, context, params, handles, &options).await
 }
 
 /// Common implementation for tar stream extraction
@@ -1986,44 +1916,6 @@ fn extract_tar_stream_impl<R: Read + Send>(
     }
 
     Err("No disk image found in tar archive".to_string())
-}
-
-/// Determine the appropriate decompressor hint based on content and compression types.
-///
-/// Returns a file pattern string that `start_decompressor_process` uses to select
-/// the appropriate decompressor command (e.g., "disk.img" -> cat, "disk.img.xz" -> xzcat).
-fn get_decompressor_hint(
-    content_type: ContentType,
-    _layer_compression: LayerCompression,
-    content_compression: Compression,
-    file_pattern: Option<&str>,
-) -> &'static str {
-    // Priority 1: If user specified a file pattern, use its extension
-    // This handles cases like gzip-compressed tar containing xz-compressed disk images
-    if let Some(p) = file_pattern {
-        if p.ends_with(".xz") {
-            return "disk.img.xz";
-        }
-        if p.ends_with(".gz") {
-            return "disk.img.gz";
-        }
-        // Pattern specified but no compression extension - assume uncompressed
-        return "disk.img";
-    }
-
-    // Priority 2: For tar archives, use content compression to determine
-    // what decompressor the extracted file needs
-    if content_type == ContentType::TarArchive {
-        return match content_compression {
-            Compression::Xz => "disk.img.xz",
-            Compression::Gzip => "disk.img.gz",
-            Compression::Zstd => "disk.img", // Zstd not supported for file-level decompression
-            Compression::None => "disk.img",
-        };
-    }
-
-    // Default: assume XZ compressed disk image (conservative choice)
-    "disk.img.xz"
 }
 
 /// Check if a path matches a disk image

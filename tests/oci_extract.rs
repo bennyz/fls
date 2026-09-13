@@ -1,7 +1,9 @@
 mod common;
 
 use fls::fls::oci::extract_files_from_oci_image_to_dir;
-use fls::{FlashOptions, OciOptions, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_SECS};
+use fls::{
+    flash_from_oci, FlashOptions, OciOptions, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_SECS,
+};
 use http_body_util::{Full, StreamBody};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -649,4 +651,168 @@ async fn test_blob_truncation_triggers_retry_and_succeeds() {
         "Expected at least 2 blob requests (initial + retry), got {}",
         total_blob_requests
     );
+}
+
+/// Like `build_tar`, but with POSIX ustar headers: content detection in the flash
+/// path keys on the "ustar\0" magic, which GNU-format headers do not carry.
+fn build_ustar_tar(entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+    let mut tar_buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        for (name, data) in entries {
+            let mut header = Header::new_ustar();
+            header.set_mode(0o644);
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, data.as_slice())
+                .expect("append tar entry");
+        }
+        builder.finish().expect("finish tar");
+    }
+    tar_buf
+}
+
+const SPARSE_BLOCK: usize = 4096;
+
+enum SparseChunk {
+    Raw(Vec<u8>),
+    Fill([u8; 4], u32),
+    DontCare(u32),
+}
+
+/// Build an Android sparse image plus the fully expanded image it encodes
+/// (DONT_CARE regions expand to zeros, as on a freshly created output file).
+fn build_sparse_image(chunks: &[SparseChunk]) -> (Vec<u8>, Vec<u8>) {
+    let block_count = |c: &SparseChunk| match c {
+        SparseChunk::Raw(d) => (d.len() / SPARSE_BLOCK) as u32,
+        SparseChunk::Fill(_, n) | SparseChunk::DontCare(n) => *n,
+    };
+    let total_blocks: u32 = chunks.iter().map(block_count).sum();
+
+    let mut simg = Vec::new();
+    simg.extend_from_slice(&0xED26FF3Au32.to_le_bytes());
+    simg.extend_from_slice(&1u16.to_le_bytes());
+    simg.extend_from_slice(&0u16.to_le_bytes());
+    simg.extend_from_slice(&28u16.to_le_bytes());
+    simg.extend_from_slice(&12u16.to_le_bytes());
+    simg.extend_from_slice(&(SPARSE_BLOCK as u32).to_le_bytes());
+    simg.extend_from_slice(&total_blocks.to_le_bytes());
+    simg.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    simg.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut expanded = Vec::new();
+    for chunk in chunks {
+        let blocks = block_count(chunk);
+        simg.extend_from_slice(&0u16.to_le_bytes()); // placeholder, patched below
+        let type_pos = simg.len() - 2;
+        simg.extend_from_slice(&0u16.to_le_bytes());
+        simg.extend_from_slice(&blocks.to_le_bytes());
+        match chunk {
+            SparseChunk::Raw(data) => {
+                simg[type_pos..type_pos + 2].copy_from_slice(&0xCAC1u16.to_le_bytes());
+                simg.extend_from_slice(&(12 + data.len() as u32).to_le_bytes());
+                simg.extend_from_slice(data);
+                expanded.extend_from_slice(data);
+            }
+            SparseChunk::Fill(pattern, n) => {
+                simg[type_pos..type_pos + 2].copy_from_slice(&0xCAC2u16.to_le_bytes());
+                simg.extend_from_slice(&16u32.to_le_bytes());
+                simg.extend_from_slice(pattern);
+                for _ in 0..(*n as usize * SPARSE_BLOCK / 4) {
+                    expanded.extend_from_slice(pattern);
+                }
+            }
+            SparseChunk::DontCare(n) => {
+                simg[type_pos..type_pos + 2].copy_from_slice(&0xCAC3u16.to_le_bytes());
+                simg.extend_from_slice(&12u32.to_le_bytes());
+                expanded.resize(expanded.len() + *n as usize * SPARSE_BLOCK, 0);
+            }
+        }
+    }
+    (simg, expanded)
+}
+
+fn flashable_manifest(media_type: &str, blob_digest: &str, blob_len: usize) -> Vec<u8> {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:config",
+            "size": 2
+        },
+        "layers": [
+            {
+                "mediaType": media_type,
+                "digest": blob_digest,
+                "size": blob_len
+            }
+        ]
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Serve `blob` as a flashable layer and flash it to a temp file; returns the file contents.
+async fn flash_blob_to_file(media_type: &str, blob_bytes: Vec<u8>) -> Vec<u8> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let blob_digest = "sha256:layer";
+    let manifest = flashable_manifest(media_type, blob_digest, blob_bytes.len());
+
+    let (local_addr, server_handle) = spawn_oci_server(
+        format!("/v2/{}/manifests/{}", REPO, TAG),
+        format!("/v2/{}/blobs/{}", REPO, blob_digest),
+        manifest,
+        blob_bytes,
+    )
+    .await;
+
+    let out_dir = tempdir().expect("create temp dir");
+    let out_path = out_dir.path().join("out.img");
+    let cert_dir = PathBuf::from("tests/test_certs");
+    let mut options = default_options(&cert_dir);
+    options.common.device = out_path.to_string_lossy().to_string();
+
+    let host = format!("127.0.0.1.nip.io:{}", local_addr.port());
+    let image_ref = format!("{}/{}:{}", host, REPO, TAG);
+    let result = flash_from_oci(&image_ref, options).await;
+    server_handle.abort();
+    assert!(result.is_ok(), "Flash failed: {:?}", result.err());
+
+    fs::read(&out_path).expect("read flashed output")
+}
+
+/// gzip tar layer containing an xz-compressed sparse image: exercises tar extraction,
+/// in-process xz decoding of the entry, sparse parsing, and zero/pattern fills.
+#[tokio::test]
+async fn test_flash_from_oci_tar_layer_with_xz_sparse_image() {
+    let raw1: Vec<u8> = (0..2 * SPARSE_BLOCK).map(|i| (i % 251) as u8).collect();
+    let raw2: Vec<u8> = (0..SPARSE_BLOCK).map(|i| (i % 13) as u8 ^ 0x5A).collect();
+    let (simg, expected) = build_sparse_image(&[
+        SparseChunk::Raw(raw1),
+        SparseChunk::Fill([0, 0, 0, 0], 1024),
+        SparseChunk::DontCare(2),
+        SparseChunk::Raw(raw2),
+        SparseChunk::Fill([0xDE, 0xAD, 0xBE, 0xEF], 3),
+        SparseChunk::Fill([0, 0, 0, 0], 256),
+    ]);
+
+    let tar_bytes = build_ustar_tar(vec![("disk.img.xz", common::compress_xz(&simg))]);
+    let blob_bytes = common::compress_gz(&tar_bytes);
+
+    let written = flash_blob_to_file("application/vnd.automotive.disk.simg", blob_bytes).await;
+    assert_eq!(written.len(), expected.len());
+    assert!(written == expected, "flashed image differs from expected");
+}
+
+/// Uncompressed tar layer containing a raw disk image: the entry is passed through unchanged.
+#[tokio::test]
+async fn test_flash_from_oci_tar_layer_with_raw_image() {
+    let mut raw = b"RAWDISK-".to_vec();
+    raw.extend((0..3 * SPARSE_BLOCK - 8).map(|i| (i * 7 % 256) as u8));
+    let blob_bytes = build_ustar_tar(vec![("disk.img", raw.clone())]);
+
+    let written = flash_blob_to_file("application/vnd.automotive.disk.raw", blob_bytes).await;
+    assert!(written == raw, "flashed image differs from expected");
 }

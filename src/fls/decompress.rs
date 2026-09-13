@@ -1,9 +1,9 @@
 use crate::fls::byte_channel::ByteBoundedReceiver;
 use crate::fls::compression::Compression;
+use crate::fls::magic_bytes::detect_compression;
 use crate::fls::stream_utils::ChannelReader;
 use bytes::Bytes;
 use std::io::Read;
-use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
@@ -48,17 +48,6 @@ pub(crate) fn create_mt_xz_decoder<R: Read + Send + 'static>(
     )))
 }
 
-/// Determines the appropriate decompression command based on URL extension
-fn get_decompressor_command(url: &str) -> &'static str {
-    let extension = url.rsplit('.').next().unwrap_or("").to_lowercase();
-    match extension.as_str() {
-        "gz" => "zcat",
-        "xz" => "xzcat",
-        "bz" | "bz2" => "bzcat",
-        _ => "cat", // Unknown extension, assume uncompressed
-    }
-}
-
 /// Checks if a binary is available on the system
 pub(crate) fn check_binary_available(cmd: &str) -> Result<(), String> {
     match std::process::Command::new(cmd)
@@ -73,17 +62,6 @@ pub(crate) fn check_binary_available(cmd: &str) -> Result<(), String> {
             cmd
         )),
     }
-}
-
-/// Starts the appropriate decompression process based on URL extension
-pub(crate) async fn start_decompressor_process(
-    url: &str,
-) -> Result<(Child, &'static str), Box<dyn std::error::Error>> {
-    let cmd = get_decompressor_command(url);
-
-    check_binary_available(cmd)?;
-    eprintln!("Using decompressor: {}", cmd);
-    spawn_decompressor(cmd)
 }
 
 /// Maps a Compression enum to the corresponding decompressor command
@@ -144,18 +122,58 @@ pub(crate) fn start_inprocess_decompressor(
     consumed_progress_tx: mpsc::UnboundedSender<u64>,
     xz_memlimit_mb: u64,
 ) -> Result<DecompressorResult, Box<dyn std::error::Error>> {
+    let reader = ChannelReader::new_byte_bounded(buffer_rx).with_progress(consumed_progress_tx);
+    spawn_decoder_thread(reader, Some(compression), xz_memlimit_mb)
+}
+
+/// Like `start_inprocess_decompressor`, but the compression format is detected
+/// from the stream's magic bytes instead of being known up front.
+pub(crate) fn start_inprocess_decompressor_autodetect(
+    reader: ChannelReader,
+    xz_memlimit_mb: u64,
+) -> Result<DecompressorResult, Box<dyn std::error::Error>> {
+    spawn_decoder_thread(reader, None, xz_memlimit_mb)
+}
+
+fn read_prefix(reader: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
+fn spawn_decoder_thread(
+    reader: ChannelReader,
+    compression: Option<Compression>,
+    xz_memlimit_mb: u64,
+) -> Result<DecompressorResult, Box<dyn std::error::Error>> {
     let (decompressed_tx, decompressed_rx) = mpsc::channel::<Vec<u8>>(8);
 
     let handle = std::thread::Builder::new()
         .name("decompressor".to_string())
         .spawn(move || {
-            let channel_reader =
-                ChannelReader::new_byte_bounded(buffer_rx).with_progress(consumed_progress_tx);
+            let mut input: Box<dyn Read + Send> = Box::new(reader);
+
+            let compression = match compression {
+                Some(c) => c,
+                None => {
+                    let mut prefix = [0u8; 6];
+                    let n = read_prefix(&mut input, &mut prefix)
+                        .map_err(|e| format!("Failed to read stream header: {}", e))?;
+                    let detected = detect_compression(&prefix[..n]);
+                    input = Box::new(std::io::Cursor::new(prefix[..n].to_vec()).chain(input));
+                    detected
+                }
+            };
 
             let mut decoder: Box<dyn Read + Send> = match compression {
-                Compression::Xz => create_mt_xz_decoder(channel_reader, xz_memlimit_mb)?,
-                Compression::Gzip => Box::new(flate2::read::GzDecoder::new(channel_reader)),
-                Compression::None => Box::new(channel_reader),
+                Compression::Xz => create_mt_xz_decoder(input, xz_memlimit_mb)?,
+                Compression::Gzip => Box::new(flate2::read::GzDecoder::new(input)),
+                Compression::None => input,
                 Compression::Zstd => {
                     return Err("Zstd in-process decompression is not supported".to_string());
                 }
@@ -180,23 +198,4 @@ pub(crate) fn start_inprocess_decompressor(
         })?;
 
     Ok((decompressed_rx, handle))
-}
-
-pub(crate) async fn spawn_stderr_reader(
-    mut stderr: tokio::process::ChildStderr,
-    error_tx: mpsc::UnboundedSender<String>,
-    process_name: &'static str,
-) {
-    let mut buffer = [0u8; 1024];
-    loop {
-        match stderr.read(&mut buffer).await {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                if let Ok(s) = String::from_utf8(buffer[..n].to_vec()) {
-                    let _ = error_tx.send(format!("{}: {}", process_name, s.trim()));
-                }
-            }
-            Err(_) => break,
-        }
-    }
 }
