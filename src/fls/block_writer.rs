@@ -15,10 +15,12 @@ const F_NOCACHE: i32 = 48; // F_NOCACHE for macOS (use with fcntl)
 // Linux ioctl definitions using nix crate's ioctl macros for safety
 #[cfg(target_os = "linux")]
 mod linux_ioctl {
-    use nix::ioctl_read;
+    use nix::{ioctl_read, ioctl_write_ptr_bad, request_code_none};
     // BLKGETSIZE64 - get device size in bytes (u64)
     // This uses the nix crate to generate the correct ioctl number for the target architecture
     ioctl_read!(blkgetsize64, 0x12, 114, u64);
+    // BLKZEROOUT - zero the byte range [offset, len] directly on the device
+    ioctl_write_ptr_bad!(blkzeroout, request_code_none!(0x12, 127), [u64; 2]);
 }
 
 #[cfg(target_os = "macos")]
@@ -125,6 +127,11 @@ pub(crate) struct BlockWriter {
     bytes_since_sync: u64, // Track bytes written since last sync
     written_progress_tx: mpsc::UnboundedSender<u64>,
     use_direct_io: bool, // Track if O_DIRECT is active
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    is_block_device: bool,
+    /// Set once the kernel zero-fill fast path has failed, so later fills go straight to plain writes
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fast_zero_disabled: bool,
     #[allow(dead_code)]
     debug: bool, // Debug mode flag
 }
@@ -142,7 +149,7 @@ impl BlockWriter {
         o_direct: bool,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
-        let (file, use_direct_io) = {
+        let (file, use_direct_io, is_block_device) = {
             use std::os::unix::fs::FileTypeExt;
 
             // Check if this is a block device
@@ -173,7 +180,7 @@ impl BlockWriter {
                                 device
                             );
                         }
-                        (f, true)
+                        (f, true, is_block_dev)
                     }
                     Err(e1) => {
                         // Try O_DIRECT with O_SYNC
@@ -185,7 +192,7 @@ impl BlockWriter {
                                         device
                                     );
                                 }
-                                (f, true)
+                                (f, true, is_block_dev)
                             }
                             Err(e2) => {
                                 return Err(io::Error::new(
@@ -206,12 +213,12 @@ impl BlockWriter {
                         device
                     );
                 }
-                (open_file(None)?, false)
+                (open_file(None)?, false, is_block_dev)
             }
         };
 
         #[cfg(target_os = "macos")]
-        let (file, use_direct_io) = {
+        let (file, use_direct_io, is_block_device) = {
             use std::os::unix::fs::FileTypeExt;
             use std::os::unix::io::AsRawFd;
 
@@ -279,7 +286,7 @@ impl BlockWriter {
                         device
                     );
                 }
-                (f, true)
+                (f, true, is_block_dev)
             } else {
                 if debug {
                     eprintln!(
@@ -287,7 +294,7 @@ impl BlockWriter {
                         device
                     );
                 }
-                (open_file(None)?, false)
+                (open_file(None)?, false, is_block_dev)
             }
         };
 
@@ -303,6 +310,8 @@ impl BlockWriter {
             bytes_since_sync: 0,
             written_progress_tx,
             use_direct_io,
+            is_block_device,
+            fast_zero_disabled: false,
             debug,
         })
     }
@@ -338,6 +347,98 @@ impl BlockWriter {
         }
 
         Ok(())
+    }
+
+    /// Write `bytes` bytes of a repeating 4-byte pattern at the current position.
+    ///
+    /// All-zero fills are offloaded to the kernel where possible (BLKZEROOUT on
+    /// block devices, fallocate on regular files), so the zeros are neither
+    /// copied through user space nor, on devices with WRITE ZEROES support,
+    /// transferred to the device at all. Anything else, or a failed fast path,
+    /// goes through the regular buffered write path.
+    pub(crate) fn fill(&mut self, pattern: &[u8; 4], bytes: u64) -> io::Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if *pattern == [0u8; 4] && self.zero_range_fast(bytes)? {
+            return Ok(());
+        }
+
+        const FILL_BUFFER_SIZE: usize = 4096;
+        let mut buffer = [0u8; FILL_BUFFER_SIZE];
+        for chunk in buffer.chunks_exact_mut(4) {
+            chunk.copy_from_slice(pattern);
+        }
+
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let to_write = (remaining as usize).min(FILL_BUFFER_SIZE);
+            self.write(&buffer[..to_write])?;
+            remaining -= to_write as u64;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn zero_range_fast(&mut self, _bytes: u64) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    /// Zero `bytes` bytes at the current position without writing them from
+    /// user space. Returns Ok(false) when the fast path is unavailable, in
+    /// which case nothing has been written and the caller must fill normally.
+    #[cfg(target_os = "linux")]
+    fn zero_range_fast(&mut self, bytes: u64) -> io::Result<bool> {
+        use std::os::unix::io::AsRawFd;
+
+        if self.fast_zero_disabled {
+            return Ok(false);
+        }
+
+        let start = self.bytes_written;
+        let end = start + bytes;
+        // BLKZEROOUT needs sector alignment; O_DIRECT additionally needs the
+        // following write to land on an aligned offset.
+        let align = if self.use_direct_io {
+            ALIGNMENT as u64
+        } else {
+            512
+        };
+        if !start.is_multiple_of(align) || !end.is_multiple_of(align) {
+            return Ok(false);
+        }
+
+        self.flush_buffer()?;
+
+        let result = if self.is_block_device {
+            let range = [start, bytes];
+            unsafe { linux_ioctl::blkzeroout(self.file.as_raw_fd(), &range) }
+                .map(|_| ())
+                .map_err(|e| io::Error::from_raw_os_error(e as i32))
+        } else {
+            fallocate_zero(&self.file, start, bytes)
+        };
+
+        match result {
+            Ok(()) => {
+                self.file.seek(io::SeekFrom::Start(end))?;
+                self.bytes_written = end;
+                let _ = self.written_progress_tx.send(self.bytes_written);
+                Ok(true)
+            }
+            Err(e) if is_unsupported(&e) => {
+                if self.debug {
+                    eprintln!(
+                        "[DEBUG] Kernel zero-fill unavailable ({}), writing zeros instead",
+                        e
+                    );
+                }
+                self.fast_zero_disabled = true;
+                self.file.seek(io::SeekFrom::Start(start))?;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Seek to an absolute position in the output
@@ -517,9 +618,7 @@ impl AsyncBlockWriter {
                 let result = match cmd {
                     WriterCommand::Write(data) => writer.write(&data),
                     WriterCommand::Seek(offset) => writer.seek(offset),
-                    WriterCommand::Fill { pattern, bytes } => {
-                        write_fill_pattern(&mut writer, &pattern, bytes)
-                    }
+                    WriterCommand::Fill { pattern, bytes } => writer.fill(&pattern, bytes),
                 };
 
                 if let Err(e) = result {
@@ -593,22 +692,52 @@ impl AsyncBlockWriter {
     }
 }
 
-/// Helper to write fill pattern efficiently.
-/// Alignment for O_DIRECT is handled by BlockWriter's internal buffer and flush_buffer(),
-/// which rounds up to ALIGNMENT when flushing partial blocks.
-fn write_fill_pattern(writer: &mut BlockWriter, pattern: &[u8; 4], bytes: u64) -> io::Result<()> {
-    // Create a 4KB buffer filled with the pattern (matches ALIGNMENT)
-    const FILL_BUFFER_SIZE: usize = 4096;
-    let mut buffer = [0u8; FILL_BUFFER_SIZE];
-    for chunk in buffer.chunks_exact_mut(4) {
-        chunk.copy_from_slice(pattern);
+/// Errors that mean the kernel zero-fill path is not available for this
+/// file or device (as opposed to a real I/O failure).
+#[cfg(target_os = "linux")]
+fn is_unsupported(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOTTY)
+            | Some(libc::EOPNOTSUPP)
+            | Some(libc::ENOSYS)
+            | Some(libc::EINVAL)
+            | Some(libc::EPERM)
+            | Some(libc::ENODEV)
+    )
+}
+
+/// Zero a byte range of a regular file through fallocate.
+///
+/// FALLOC_FL_ZERO_RANGE is preferred; filesystems without it (e.g. tmpfs)
+/// get a hole punched instead, and the file is extended so the range reads
+/// back as zeros either way.
+#[cfg(target_os = "linux")]
+fn fallocate_zero(file: &std::fs::File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let to_off = |v: u64| {
+        libc::off_t::try_from(v)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "zero range exceeds off_t"))
+    };
+    let (off, ln) = (to_off(offset)?, to_off(len)?);
+
+    if unsafe { libc::fallocate(fd, libc::FALLOC_FL_ZERO_RANGE, off, ln) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if !is_unsupported(&err) {
+        return Err(err);
     }
 
-    let mut remaining = bytes;
-    while remaining > 0 {
-        let to_write = (remaining as usize).min(FILL_BUFFER_SIZE);
-        writer.write(&buffer[..to_write])?;
-        remaining -= to_write as u64;
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    if unsafe { libc::fallocate(fd, mode, off, ln) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let end = offset + len;
+    if file.metadata()?.len() < end {
+        file.set_len(end)?;
     }
     Ok(())
 }
@@ -659,6 +788,74 @@ pub(crate) fn get_device_size(path: &str) -> io::Result<u64> {
             } else {
                 Err(io::Error::last_os_error())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn writer_for(path: &std::path::Path) -> (BlockWriter, mpsc::UnboundedReceiver<u64>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = BlockWriter::new(path.to_str().unwrap(), tx, false, false).unwrap();
+        (writer, rx)
+    }
+
+    #[test]
+    fn zero_fill_regular_file_reads_back_as_zeros_and_extends_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.img");
+        let (mut writer, _rx) = writer_for(&path);
+
+        writer.write(&[0xAA; 8192]).unwrap();
+        writer.fill(&[0, 0, 0, 0], 1024 * 1024).unwrap();
+        writer.write(&[0xBB; 4096]).unwrap();
+        writer.fill(&[0, 0, 0, 0], 2 * 1024 * 1024).unwrap();
+        writer.flush().unwrap();
+
+        let expected_len = 8192 + 1024 * 1024 + 4096 + 2 * 1024 * 1024;
+        assert_eq!(writer.bytes_written(), expected_len as u64);
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), expected_len);
+        assert!(data[..8192].iter().all(|&b| b == 0xAA));
+        assert!(data[8192..8192 + 1024 * 1024].iter().all(|&b| b == 0));
+        let raw2 = 8192 + 1024 * 1024;
+        assert!(data[raw2..raw2 + 4096].iter().all(|&b| b == 0xBB));
+        assert!(data[raw2 + 4096..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn unaligned_zero_fill_falls_back_to_plain_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.img");
+        let (mut writer, _rx) = writer_for(&path);
+
+        writer.write(&[0x11; 100]).unwrap();
+        writer.fill(&[0, 0, 0, 0], 1000).unwrap();
+        writer.write(&[0x22; 50]).unwrap();
+        writer.flush().unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 1150);
+        assert!(data[..100].iter().all(|&b| b == 0x11));
+        assert!(data[100..1100].iter().all(|&b| b == 0));
+        assert!(data[1100..].iter().all(|&b| b == 0x22));
+    }
+
+    #[test]
+    fn pattern_fill_repeats_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.img");
+        let (mut writer, _rx) = writer_for(&path);
+
+        writer.fill(&[0xDE, 0xAD, 0xBE, 0xEF], 10000).unwrap();
+        writer.flush().unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 10000);
+        for (i, &b) in data.iter().enumerate() {
+            assert_eq!(b, [0xDE, 0xAD, 0xBE, 0xEF][i % 4]);
         }
     }
 }
