@@ -576,9 +576,9 @@ pub async fn flash_from_url(
     // Force a final progress update to show completion
     let _ = progress.update_progress(None, update_interval, true);
 
-    // Wait for message processor to finish (with timeout)
-    let timeout_duration = Duration::from_secs(2);
-    let _ = tokio::time::timeout(timeout_duration, error_processor).await;
+    // Close our end of the error channel so the processor drains and exits
+    drop(error_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), error_processor).await;
 
     progress.print_final_stats_with_ratio();
 
