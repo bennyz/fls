@@ -600,8 +600,8 @@ fn write_fill_pattern(writer: &mut BlockWriter, pattern: &[u8; 4], bytes: u64) -
     // Create a 4KB buffer filled with the pattern (matches ALIGNMENT)
     const FILL_BUFFER_SIZE: usize = 4096;
     let mut buffer = [0u8; FILL_BUFFER_SIZE];
-    for chunk in buffer.chunks_exact_mut(4) {
-        chunk.copy_from_slice(pattern);
+    for chunk in buffer.as_chunks_mut::<4>().0 {
+        *chunk = *pattern;
     }
 
     let mut remaining = bytes;

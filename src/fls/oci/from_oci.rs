@@ -875,14 +875,15 @@ pub async fn extract_files_by_annotations_with_overrides_to_dir(
     Ok(Some(partition_files))
 }
 
+/// Ensure that the layer compression is supported by fls.
 fn ensure_supported_layer_compression(
     compression: LayerCompression,
     media_type: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match compression {
-        LayerCompression::None | LayerCompression::Gzip => Ok(()),
+        LayerCompression::None | LayerCompression::Gzip | LayerCompression::Xz => Ok(()),
         other => Err(format!(
-            "Unsupported OCI layer compression {:?} (media type: {}). Supported: uncompressed, gzip",
+            "Unsupported OCI layer compression {:?} (media type: {}). Supported: uncompressed, gzip, xz",
             other, media_type
         )
         .into()),
@@ -2455,6 +2456,13 @@ fn extract_tar_archive_from_stream(
         }
         LayerCompression::Zstd => {
             return Err("Zstd layer compression is not supported yet".to_string());
+        }
+        LayerCompression::Xz => {
+            if debug {
+                eprintln!("[DEBUG] Layer is XZ compressed (manifest), will be decompressed during tar extraction");
+            }
+            // XZ decompression happens in extract_tar_stream_impl via magic byte detection
+            Box::new(reader)
         }
         LayerCompression::None => {
             // When manifest says no compression, use content detection result
