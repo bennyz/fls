@@ -8,6 +8,11 @@ use tokio::sync::mpsc;
 const BLOCK_SIZE: usize = 1024 * 1024; // 1MB blocks for better throughput
 const ALIGNMENT: usize = 4096; // 4KB alignment for direct I/O
 
+/// Smallest zero fill worth handing to the kernel. Below this the fill goes
+/// through the write buffer like any other data, so runs of small FILL chunks
+/// interleaved with RAW data do not break the stream of 1 MiB writes.
+const ZERO_FAST_PATH_MIN_BYTES: u64 = 1024 * 1024;
+
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 const F_NOCACHE: i32 = 48; // F_NOCACHE for macOS (use with fcntl)
@@ -129,9 +134,12 @@ pub(crate) struct BlockWriter {
     use_direct_io: bool, // Track if O_DIRECT is active
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     is_block_device: bool,
-    /// Set once the kernel zero-fill fast path has failed, so later fills go straight to plain writes
+    /// Whether large zero fills are handed to the kernel (BLKZEROOUT or
+    /// fallocate). Off for block devices without native WRITE ZEROES, where
+    /// the kernel would just emulate it with ordinary writes, and cleared for
+    /// good once the fast path fails.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fast_zero_disabled: bool,
+    zero_fast_path: bool,
     #[allow(dead_code)]
     debug: bool, // Debug mode flag
 }
@@ -298,6 +306,22 @@ impl BlockWriter {
             }
         };
 
+        #[cfg(target_os = "linux")]
+        let zero_fast_path = if is_block_device {
+            let native = supports_write_zeroes(&file);
+            if debug && !native {
+                eprintln!(
+                    "[DEBUG] {} has no native WRITE ZEROES support, zero fills are written normally",
+                    device
+                );
+            }
+            native
+        } else {
+            true
+        };
+        #[cfg(not(target_os = "linux"))]
+        let zero_fast_path = false;
+
         // Create aligned buffer for direct I/O
         // Direct I/O requires buffer to be aligned to sector size (typically 512 or 4096)
         let buffer = AlignedBuffer::new(BLOCK_SIZE, ALIGNMENT);
@@ -311,7 +335,7 @@ impl BlockWriter {
             written_progress_tx,
             use_direct_io,
             is_block_device,
-            fast_zero_disabled: false,
+            zero_fast_path,
             debug,
         })
     }
@@ -351,16 +375,18 @@ impl BlockWriter {
 
     /// Write `bytes` bytes of a repeating 4-byte pattern at the current position.
     ///
-    /// All-zero fills are offloaded to the kernel where possible (BLKZEROOUT on
-    /// block devices, fallocate on regular files), so the zeros are neither
-    /// copied through user space nor, on devices with WRITE ZEROES support,
-    /// transferred to the device at all. Anything else, or a failed fast path,
-    /// goes through the regular buffered write path.
+    /// Large all-zero fills are offloaded to the kernel where that avoids the
+    /// transfer entirely: BLKZEROOUT on block devices with native WRITE ZEROES,
+    /// fallocate on regular files. Everything else goes through the regular
+    /// buffered write path.
     pub(crate) fn fill(&mut self, pattern: &[u8; 4], bytes: u64) -> io::Result<()> {
         if bytes == 0 {
             return Ok(());
         }
-        if *pattern == [0u8; 4] && self.zero_range_fast(bytes)? {
+        if *pattern == [0u8; 4]
+            && bytes >= ZERO_FAST_PATH_MIN_BYTES
+            && self.zero_range_fast(bytes)?
+        {
             return Ok(());
         }
 
@@ -391,7 +417,7 @@ impl BlockWriter {
     fn zero_range_fast(&mut self, bytes: u64) -> io::Result<bool> {
         use std::os::unix::io::AsRawFd;
 
-        if self.fast_zero_disabled {
+        if !self.zero_fast_path {
             return Ok(false);
         }
 
@@ -433,7 +459,7 @@ impl BlockWriter {
                         e
                     );
                 }
-                self.fast_zero_disabled = true;
+                self.zero_fast_path = false;
                 self.file.seek(io::SeekFrom::Start(start))?;
                 Ok(false)
             }
@@ -692,6 +718,37 @@ impl AsyncBlockWriter {
     }
 }
 
+/// Whether a block device can zero a range without transferring data
+/// (`write_zeroes_max_bytes` in sysfs is non-zero). Without that the kernel
+/// emulates BLKZEROOUT with ordinary writes, which gains nothing over the
+/// write buffer and costs a stream split per fill. Unknown means no.
+#[cfg(target_os = "linux")]
+fn supports_write_zeroes(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let rdev = meta.rdev();
+    let (major, minor) = (libc::major(rdev), libc::minor(rdev));
+    // Whole disks have queue/ directly; partitions find it on the parent disk.
+    let candidates = [
+        format!(
+            "/sys/dev/block/{}:{}/queue/write_zeroes_max_bytes",
+            major, minor
+        ),
+        format!(
+            "/sys/dev/block/{}:{}/../queue/write_zeroes_max_bytes",
+            major, minor
+        ),
+    ];
+    candidates
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|max_bytes| max_bytes > 0)
+}
+
 /// Errors that mean the kernel zero-fill path is not available for this
 /// file or device (as opposed to a real I/O failure).
 #[cfg(target_os = "linux")]
@@ -809,18 +866,20 @@ mod tests {
         let (mut writer, _rx) = writer_for(&path);
 
         writer.write(&[0xAA; 8192]).unwrap();
+        writer.fill(&[0, 0, 0, 0], 4096).unwrap(); // below the fast-path threshold
         writer.fill(&[0, 0, 0, 0], 1024 * 1024).unwrap();
         writer.write(&[0xBB; 4096]).unwrap();
         writer.fill(&[0, 0, 0, 0], 2 * 1024 * 1024).unwrap();
         writer.flush().unwrap();
 
-        let expected_len = 8192 + 1024 * 1024 + 4096 + 2 * 1024 * 1024;
+        let zeros1 = 4096 + 1024 * 1024;
+        let expected_len = 8192 + zeros1 + 4096 + 2 * 1024 * 1024;
         assert_eq!(writer.bytes_written(), expected_len as u64);
         let data = std::fs::read(&path).unwrap();
         assert_eq!(data.len(), expected_len);
         assert!(data[..8192].iter().all(|&b| b == 0xAA));
-        assert!(data[8192..8192 + 1024 * 1024].iter().all(|&b| b == 0));
-        let raw2 = 8192 + 1024 * 1024;
+        assert!(data[8192..8192 + zeros1].iter().all(|&b| b == 0));
+        let raw2 = 8192 + zeros1;
         assert!(data[raw2..raw2 + 4096].iter().all(|&b| b == 0xBB));
         assert!(data[raw2 + 4096..].iter().all(|&b| b == 0));
     }
