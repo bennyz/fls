@@ -1240,3 +1240,77 @@ async fn local_source_cli_fails_cleanly_without_retries() {
         }
     }
 }
+
+/// An xz image whose data is corrupt about a quarter of the way in.
+///
+/// Random data in 1 MiB blocks makes the decoder fail at the corrupt block,
+/// long before the input ends, so the feed loop is still sending when the
+/// decompressor exits.
+fn corrupt_xz_image() -> Vec<u8> {
+    use liblzma::stream::{Check, MtStreamBuilder};
+    use std::io::Write;
+
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let data: Vec<u8> = (0..16 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let stream = MtStreamBuilder::new()
+        .threads(1)
+        .block_size(1024 * 1024)
+        .preset(6)
+        .check(Check::Crc64)
+        .encoder()
+        .unwrap();
+    let mut encoder = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+    encoder.write_all(&data).unwrap();
+    let mut xz = encoder.finish().unwrap();
+    let at = xz.len() / 4;
+    for byte in &mut xz[at..at + 64] {
+        *byte ^= 0xff;
+    }
+    xz
+}
+
+/// A decompression error mid-stream must surface as that error, with a full
+/// input buffer, for both local files and HTTP downloads.
+#[tokio::test]
+async fn corrupt_input_reports_decompression_error() {
+    let image = corrupt_xz_image();
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("bad.img.xz");
+    std::fs::write(&local, &image).unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/bad.img.xz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(image))
+        .mount(&server)
+        .await;
+    let url = format!("{}/bad.img.xz", server.uri());
+
+    // Run each source a few times: which pipeline stage notices first is a race.
+    for source in [local.display().to_string(), url] {
+        for run in 0..3 {
+            let device = NamedTempFile::new().unwrap();
+            let mut options = test_options(device.path().display().to_string());
+            options.common.buffer_size_mb = 1;
+            options.retry_delay_secs = 0;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                flash_from(&source, options),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{source} run {run}: flash hung"));
+            let error = result.expect_err("corrupt input must fail").to_string();
+            assert!(
+                error.contains("Decompression error"),
+                "{source} run {run}: {error}"
+            );
+        }
+    }
+}

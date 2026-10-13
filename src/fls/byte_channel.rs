@@ -32,18 +32,20 @@ impl<T: SizedItem> ByteBoundedSender<T> {
     ///
     /// Acquires `min(item.byte_size(), max_bytes)` permits so a single
     /// oversized chunk can still pass through without deadlocking.
+    ///
+    /// Fails once the receiver is dropped, even while waiting for budget.
     pub async fn send(&self, item: T) -> Result<(), mpsc::error::SendError<T>> {
         let permits_needed = item.byte_size().min(self.max_bytes);
 
         let permits_needed_u32 = permits_needed as u32;
 
-        // acquire_many_owned returns OwnedSemaphorePermit which we intentionally
-        // forget — the receiver side adds permits back after consuming the item.
-        let permit = self
-            .semaphore
-            .acquire_many(permits_needed_u32)
-            .await
-            .expect("semaphore closed unexpectedly");
+        // We intentionally forget the permit — the receiver side adds permits
+        // back after consuming the item. The acquire fails when the receiver
+        // has closed the semaphore, so a full buffer with no reader errors
+        // instead of waiting forever.
+        let Ok(permit) = self.semaphore.acquire_many(permits_needed_u32).await else {
+            return Err(mpsc::error::SendError(item));
+        };
         permit.forget();
 
         self.inner.send(item).await
@@ -76,6 +78,13 @@ impl<T: SizedItem> ByteBoundedReceiver<T> {
         let to_release = item.byte_size().min(self.max_bytes);
         self.semaphore.add_permits(to_release);
         Some(item)
+    }
+}
+
+impl<T: SizedItem> Drop for ByteBoundedReceiver<T> {
+    /// Wake senders waiting for byte budget that no reader will ever return.
+    fn drop(&mut self) {
+        self.semaphore.close();
     }
 }
 
@@ -201,6 +210,24 @@ mod tests {
         // Should be able to receive it
         let received = rx.recv().await.unwrap();
         assert_eq!(received, big_chunk);
+    }
+
+    #[tokio::test]
+    async fn test_send_fails_when_receiver_dropped_with_full_buffer() {
+        let (tx, rx) = byte_bounded_channel::<Bytes>(10, 5);
+        tx.send(Bytes::from(vec![0u8; 10])).await.unwrap();
+
+        // The buffer is full, so this send waits for byte budget.
+        let blocked = tokio::spawn(async move { tx.send(Bytes::from(vec![1u8; 1])).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!blocked.is_finished());
+
+        drop(rx);
+        let result = timeout(Duration::from_millis(500), blocked)
+            .await
+            .expect("send must not wait forever once the receiver is gone")
+            .unwrap();
+        assert!(result.is_err());
     }
 
     #[tokio::test]

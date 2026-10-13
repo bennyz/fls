@@ -31,17 +31,6 @@ async fn await_writer_result(handle: JoinHandle<io::Result<u64>>) -> io::Result<
     }
 }
 
-/// Get error from a prematurely finished writer handle
-///
-/// Called when writer_handle.is_finished() returns true unexpectedly during download.
-/// Returns an appropriate error for the unexpected termination.
-async fn get_writer_error(handle: JoinHandle<io::Result<u64>>) -> Box<dyn std::error::Error> {
-    match await_writer_result(handle).await {
-        Ok(_) => "Writer closed unexpectedly before download completed".into(),
-        Err(e) => e.into(),
-    }
-}
-
 use crate::fls::download_error::handle_download_retry;
 
 /// Execute a sequence of write commands on the block writer
@@ -225,20 +214,6 @@ fn local_file_stream(
     .boxed()
 }
 
-/// Convert a joined writer result into an error.
-///
-/// Used when the writer branch of a `select!` wins: the result is already the
-/// joined writer result, so it must not be awaited a second time.
-fn writer_join_error(
-    result: Result<io::Result<u64>, tokio::task::JoinError>,
-) -> Box<dyn std::error::Error> {
-    match result {
-        Ok(Ok(_)) => "Writer closed unexpectedly before input completed".into(),
-        Ok(Err(e)) => e.into(),
-        Err(e) => io::Error::other(format!("Writer task panicked: {e}")).into(),
-    }
-}
-
 /// The decompressor thread has already exited (its input channel closed), so
 /// joining it directly is safe and short. Returns its originating error.
 fn decompressor_exited_error(
@@ -251,6 +226,156 @@ fn decompressor_exited_error(
     }
 }
 
+/// Error for a pipeline that stopped before the input ended.
+///
+/// Either the writer failed and the decompressor then exited because its
+/// output closed, or the decompressor failed and the writer then finished
+/// because its input ended. In both cases the writer finishes, so waiting
+/// for it tells the two apart.
+async fn pipeline_stopped_error(
+    writer: JoinHandle<io::Result<u64>>,
+    decompressor: std::thread::JoinHandle<Result<(), String>>,
+) -> Box<dyn std::error::Error> {
+    match await_writer_result(writer).await {
+        Err(e) => e.into(),
+        Ok(_) => decompressor_exited_error(decompressor),
+    }
+}
+
+type InputStream = BoxStream<'static, Result<bytes::Bytes, DownloadError>>;
+
+/// How long an HTTP body may stall before the connection counts as broken.
+const HTTP_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Where `flash_from` reads its bytes.
+///
+/// Both kinds yield chunks until the input ends or fails for good. An HTTP
+/// source reconnects and resumes on its own, so the feed loop has one path.
+enum Source<'a> {
+    Local { stream: InputStream, size: u64 },
+    Http(HttpSource<'a>),
+}
+
+impl Source<'_> {
+    async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>, DownloadError> {
+        match self {
+            Source::Local { stream, .. } => stream.next().await.transpose(),
+            Source::Http(http) => http.next_chunk().await,
+        }
+    }
+
+    fn content_length(&self) -> Option<u64> {
+        match self {
+            Source::Local { size, .. } => Some(*size),
+            Source::Http(http) => http.content_length,
+        }
+    }
+}
+
+/// An HTTP download that reconnects with a `Range` request after a timeout
+/// or broken connection, so it reads as one continuous stream of chunks.
+struct HttpSource<'a> {
+    url: &'a str,
+    client: reqwest::Client,
+    options: &'a BlockFlashOptions,
+    body: Option<InputStream>,
+    received: u64,
+    content_length: Option<u64>,
+    retry_count: usize,
+}
+
+impl<'a> HttpSource<'a> {
+    fn new(url: &'a str, client: reqwest::Client, options: &'a BlockFlashOptions) -> Self {
+        Self {
+            url,
+            client,
+            options,
+            body: None,
+            received: 0,
+            content_length: None,
+            retry_count: 0,
+        }
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>, DownloadError> {
+        loop {
+            if self.body.is_none() {
+                // Resume from what was already handed out, not from what the
+                // decompressor has consumed: the buffer holds the difference.
+                let resume_from = (self.received > 0).then_some(self.received);
+                let response = start_download(
+                    self.url,
+                    &self.client,
+                    resume_from,
+                    &self.options.headers,
+                    self.options.common.debug,
+                )
+                .await;
+                match response {
+                    Ok(response) => {
+                        if self.content_length.is_none() {
+                            // A resumed response only counts the remaining bytes.
+                            self.content_length =
+                                response.content_length().map(|len| len + self.received);
+                        }
+                        self.body = Some(
+                            response
+                                .bytes_stream()
+                                .map(|result| result.map_err(DownloadError::from_reqwest))
+                                .boxed(),
+                        );
+                    }
+                    Err(e) => {
+                        self.wait_before_retry(e).await?;
+                        continue;
+                    }
+                }
+            }
+
+            let body = self.body.as_mut().expect("connected above");
+            let error = match tokio::time::timeout(HTTP_CHUNK_TIMEOUT, body.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    self.received += chunk.len() as u64;
+                    self.retry_count = 0;
+                    return Ok(Some(chunk));
+                }
+                Ok(None) => return Ok(None),
+                Ok(Some(Err(e))) => e,
+                Err(_) => DownloadError::TimeoutError("Connection timeout (30s)".to_string()),
+            };
+            eprintln!("\nConnection interrupted: {}", error.format_error());
+            self.body = None;
+            self.wait_before_retry(error).await?;
+        }
+    }
+
+    /// Sleep before the next attempt, or give up with `error`.
+    async fn wait_before_retry(&mut self, error: DownloadError) -> Result<(), DownloadError> {
+        match handle_download_retry(
+            &error,
+            &mut self.retry_count,
+            self.options.max_retries,
+            self.options.retry_delay_secs,
+        ) {
+            Some(delay) => {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
+            None => Err(error),
+        }
+    }
+}
+
+/// Why the feed loop stopped.
+enum FeedEnd {
+    /// The source ended normally.
+    Done,
+    /// The source failed for good; an HTTP source has used up its retries.
+    SourceFailed(DownloadError),
+    /// The decompressor or writer stopped before the input ended.
+    PipelineStopped,
+}
+
 /// Flash a block device from a source.
 ///
 /// The source is an HTTP/HTTPS URL, a `file://`-prefixed path, or a plain
@@ -261,17 +386,10 @@ pub async fn flash_from(
     source: &str,
     options: BlockFlashOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Classify the source: local file or HTTP/HTTPS download.
-    let local_path = local_source_path(source)?;
-    let is_local = local_path.is_some();
-
-    // Prepare the input before touching the destination: open and validate the
-    // local source, or create the HTTP client for downloads.
-    type InputStream = BoxStream<'static, Result<bytes::Bytes, DownloadError>>;
-    let mut local_stream: Option<InputStream> = None;
-    let mut local_file_size: Option<u64> = None;
-    let mut client: Option<reqwest::Client> = None;
-    let compression = if let Some(path) = local_path {
+    // Prepare the input before touching the destination: open and validate a
+    // local source, or create the HTTP client for a download. An HTTP source
+    // connects on its first read, after the destination is open.
+    let (mut input, compression) = if let Some(path) = local_source_path(source)? {
         let file = tokio::fs::File::open(&path)
             .await
             .map_err(|e| format!("Failed to open source file '{}': {e}", path.display()))?;
@@ -284,17 +402,25 @@ pub async fn flash_from(
         if !metadata.is_file() {
             return Err(format!("Source '{}' is not a regular file", path.display()).into());
         }
-        let file_size = metadata.len();
         eprintln!("Reading source file: {}", path.display());
         let compression = get_compression_from_path(&path);
-        local_file_size = Some(file_size);
-        local_stream = Some(local_file_stream(file, path));
-        compression
+        let stream = local_file_stream(file, path);
+        (
+            Source::Local {
+                stream,
+                size: metadata.len(),
+            },
+            compression,
+        )
     } else {
         let http_options: HttpClientOptions = (&options).into();
-        client = Some(setup_http_client(&http_options).await?);
-        get_compression_from_url(source)
+        let client = setup_http_client(&http_options).await?;
+        (
+            Source::Http(HttpSource::new(source, client, &options)),
+            get_compression_from_url(source),
+        )
     };
+    let is_local = matches!(input, Source::Local { .. });
 
     if compression == Compression::Zstd {
         return Err("Zstd in-process decompression is not supported".into());
@@ -347,7 +473,7 @@ pub async fn flash_from(
     // Spawn background task to read decompressed data and write to block device
     let error_tx_clone = error_tx.clone();
     let debug = options.common.debug;
-    let mut writer_handle = {
+    let writer_handle = {
         let writer = block_writer;
         tokio::spawn(async move {
             let mut detector = FormatDetector::new();
@@ -424,7 +550,7 @@ pub async fn flash_from(
     // Spawn message processors
     let error_processor = tokio::spawn(process_error_messages(error_rx));
 
-    // Main input loop with retry logic (retries apply to HTTP downloads only)
+    // Main input loop (HTTP retries happen inside the source)
     let mut progress =
         ProgressTracker::new(options.common.newline_progress, options.common.show_memory);
     progress.set_is_compressed(is_compressed);
@@ -433,239 +559,85 @@ pub async fn flash_from(
     }
     let update_interval = Duration::from_secs_f64(options.common.progress_interval_secs);
     let mut bytes_sent_to_decompressor: u64 = 0;
-    let mut retry_count = 0;
     let debug = options.common.debug;
 
-    loop {
+    // Move chunks from the source into the buffer. An HTTP source retries
+    // inside `next_chunk`, so every way out of this loop is final.
+    let end = loop {
         if writer_handle.is_finished() {
-            eprintln!();
-            eprintln!("Writer task has terminated, stopping input");
-            return Err(get_writer_error(writer_handle).await);
+            break FeedEnd::PipelineStopped;
         }
-
-        let (content_length, mut stream): (Option<u64>, InputStream) = if let Some(stream) =
-            local_stream.take()
-        {
-            // Local source: a single pass, no retries.
-            (local_file_size, stream)
-        } else {
-            // Resume from the HTTP download position, not the decompressor write position
-            // The buffer may contain data that's been downloaded but not yet written to decompressor
-            let resume_from = if progress.bytes_received > 0 {
-                Some(progress.bytes_received)
-            } else {
-                None
-            };
-
-            // Start or resume download
-            let client = client
-                .as_ref()
-                .expect("HTTP client is prepared for non-local sources");
-            let response =
-                match start_download(source, client, resume_from, &options.headers, debug).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        match handle_download_retry(
-                            &e,
-                            &mut retry_count,
-                            options.max_retries,
-                            options.retry_delay_secs,
-                        ) {
-                            Some(delay) => {
-                                tokio::time::sleep(delay).await;
-                                continue;
-                            }
-                            None => return Err(e.into()),
-                        }
-                    }
-                };
-
-            let content_length = if let Some(offset) = resume_from {
-                // For resumed downloads, we need to add the offset to partial content length
-                response.content_length().map(|len| len + offset)
-            } else {
-                response.content_length()
-            };
-
-            (
-                content_length,
-                response
-                    .bytes_stream()
-                    .map(|result| result.map_err(DownloadError::from_reqwest))
-                    .boxed(),
-            )
+        let chunk = match input.next_chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break FeedEnd::Done,
+            Err(e) => break FeedEnd::SourceFailed(e),
         };
-
-        // Set content length in progress tracker (only on first attempt)
         if progress.content_length.is_none() {
-            progress.set_content_length(content_length);
+            progress.set_content_length(input.content_length());
+        }
+        let chunk_len = chunk.len() as u64;
+
+        // Send to buffer - detect if it's blocking. The send fails as soon as
+        // the decompressor has exited, whether or not the buffer is full.
+        let send_start = std::time::Instant::now();
+        if buffer_tx.send(chunk).await.is_err() {
+            break FeedEnd::PipelineStopped;
+        }
+        let send_duration = send_start.elapsed();
+
+        // If send took a long time, buffer was probably full
+        if debug && send_duration > Duration::from_millis(100) {
+            eprintln!(
+                "\n[DEBUG] Buffer send blocked for {:.2}s (buffer full, decompressor bottleneck)",
+                send_duration.as_secs_f64()
+            );
         }
 
-        // Read and buffer chunks for this connection
-        let mut connection_broken = false;
-        let mut connection_error: Option<DownloadError> = None;
+        // Update input progress
+        progress.bytes_received += chunk_len;
 
-        loop {
-            // Local reads have no network timeout; HTTP chunks wait at most 30s.
-            let chunk: Option<Result<bytes::Bytes, DownloadError>> = if is_local {
-                stream.next().await
-            } else {
-                match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        connection_error = Some(DownloadError::TimeoutError(
-                            "Connection timeout (30s)".to_string(),
-                        ));
-                        connection_broken = true;
-                        break;
-                    }
-                }
-            };
-
-            match chunk {
-                Some(Ok(chunk)) => {
-                    let chunk_len = chunk.len() as u64;
-
-                    // Send to buffer - detect if it's blocking
-                    let send_start = std::time::Instant::now();
-                    let send_failed = if is_local {
-                        // A local feed must observe writer termination while waiting
-                        // on byte-budget permits, so a dead writer is reported
-                        // immediately instead of after the buffer fills.
-                        tokio::select! {
-                            result = buffer_tx.send(chunk) => result.is_err(),
-                            writer_result = &mut writer_handle => {
-                                eprintln!();
-                                eprintln!("Writer task has terminated unexpectedly");
-                                return Err(writer_join_error(writer_result));
-                            }
-                        }
-                    } else {
-                        buffer_tx.send(chunk).await.is_err()
-                    };
-                    if send_failed {
-                        if writer_handle.is_finished() {
-                            eprintln!();
-                            eprintln!("Writer task has terminated unexpectedly");
-                            return Err(get_writer_error(writer_handle).await);
-                        }
-                        if is_local {
-                            // The decompressor exited early; report its error.
-                            eprintln!();
-                            return Err(decompressor_exited_error(decompressor_handle));
-                        }
-                        connection_error =
-                            Some(DownloadError::Other("Buffer channel closed".to_string()));
-                        connection_broken = true;
-                        break;
-                    }
-                    let send_duration = send_start.elapsed();
-
-                    // If send took a long time, buffer was probably full
-                    if debug && send_duration > Duration::from_millis(100) {
-                        eprintln!("\n[DEBUG] Buffer send blocked for {:.2}s (buffer full, decompressor bottleneck)", send_duration.as_secs_f64());
-                    }
-
-                    // Update input progress
-                    progress.bytes_received += chunk_len;
-                    if !is_local {
-                        retry_count = 0; // Reset retry count on successful download
-                    }
-
-                    // Track bytes actually written to decompressor
-                    while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
-                        bytes_sent_to_decompressor += written_len;
-                        progress.bytes_sent_to_decompressor += written_len;
-                    }
-
-                    // Debug: Show buffer lag (data read but not yet written to decompressor)
-                    if debug && (progress.bytes_received % (50 * 1024 * 1024)) < chunk_len {
-                        let buffer_lag_mb = (progress.bytes_received - bytes_sent_to_decompressor)
-                            as f64
-                            / (1024.0 * 1024.0);
-                        eprintln!(
-                            "[DEBUG] Buffer lag: {:.2} MB (read but not yet sent to decompressor)",
-                            buffer_lag_mb
-                        );
-                    }
-
-                    // Update progress from other channels
-                    while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
-                        progress.bytes_decompressed += byte_count;
-                    }
-
-                    while let Ok(written_bytes) = written_progress_rx.try_recv() {
-                        progress.bytes_written = written_bytes;
-                    }
-
-                    if let Err(e) = progress.update_progress(content_length, update_interval, false)
-                    {
-                        eprintln!();
-                        return Err(e);
-                    }
-                }
-                Some(Err(e)) => {
-                    connection_error = Some(e);
-                    connection_broken = true;
-                    break;
-                }
-                None => {
-                    // Stream ended successfully
-                    break;
-                }
-            }
+        // Track bytes actually written to decompressor
+        while let Ok(written_len) = decompressor_written_progress_rx.try_recv() {
+            bytes_sent_to_decompressor += written_len;
+            progress.bytes_sent_to_decompressor += written_len;
         }
 
-        if connection_broken {
-            if is_local {
-                // Local source errors are not retryable: report and stop.
-                if writer_handle.is_finished() {
-                    eprintln!();
-                    eprintln!("Source read interrupted and writer task has terminated");
-                    return Err(get_writer_error(writer_handle).await);
-                }
-                if let Some(e) = connection_error {
-                    eprintln!();
-                    return Err(e.into());
-                }
-                return Err("Source read failed with unknown error".into());
-            }
-
-            if writer_handle.is_finished() {
-                eprintln!();
-                eprintln!("Connection interrupted and writer task has terminated");
-                return Err(get_writer_error(writer_handle).await);
-            }
-
-            if let Some(e) = connection_error {
-                eprintln!("\nConnection interrupted: {}", e.format_error());
-                match handle_download_retry(
-                    &e,
-                    &mut retry_count,
-                    options.max_retries,
-                    options.retry_delay_secs,
-                ) {
-                    Some(delay) => {
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    None => return Err(e.into()),
-                }
-            } else {
-                // Unknown error
-                eprintln!("\nConnection interrupted with unknown error");
-                if retry_count >= options.max_retries {
-                    eprintln!("\nMax retries ({}) reached, giving up", options.max_retries);
-                    return Err("Download failed after max retries".into());
-                }
-                tokio::time::sleep(Duration::from_secs(options.retry_delay_secs)).await;
-                retry_count += 1;
-                continue;
-            }
+        // Debug: Show buffer lag (data read but not yet written to decompressor)
+        if debug && (progress.bytes_received % (50 * 1024 * 1024)) < chunk_len {
+            let buffer_lag_mb =
+                (progress.bytes_received - bytes_sent_to_decompressor) as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "[DEBUG] Buffer lag: {:.2} MB (read but not yet sent to decompressor)",
+                buffer_lag_mb
+            );
         }
 
-        // Input completed successfully
-        break;
+        // Update progress from other channels
+        while let Ok(byte_count) = decompressed_progress_rx.try_recv() {
+            progress.bytes_decompressed += byte_count;
+        }
+
+        while let Ok(written_bytes) = written_progress_rx.try_recv() {
+            progress.bytes_written = written_bytes;
+        }
+
+        if let Err(e) = progress.update_progress(input.content_length(), update_interval, false) {
+            eprintln!();
+            return Err(e);
+        }
+    };
+
+    match end {
+        FeedEnd::Done => {}
+        FeedEnd::SourceFailed(e) if !writer_handle.is_finished() => {
+            eprintln!();
+            return Err(e.into());
+        }
+        // A source error after the writer stopped is a symptom; report the cause.
+        FeedEnd::SourceFailed(_) | FeedEnd::PipelineStopped => {
+            eprintln!();
+            return Err(pipeline_stopped_error(writer_handle, decompressor_handle).await);
+        }
     }
 
     // Capture the download rate and duration at completion
